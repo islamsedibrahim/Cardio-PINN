@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+cardiosolv_output/
+*_cardiosolv.usda
+*_cardiosolv_twin.usdc

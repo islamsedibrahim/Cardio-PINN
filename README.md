@@ -111,3 +111,15 @@ After setting all input parameters described, PINN can be trained on a synthetic
 `python CardioPINN.py`
 
 The code is developed by Dr. Stefano Buoso `buoso@biomed.ee.ethz.ch` [Cardiac Magnetic Resonance group](http://www.cmr.ethz.ch/), Institute for Biomedical Engineering, ETH Zurich, University of Zurich.
+
+# CardioSolv Digital Twin (Isaac Sim 6 extension)
+
+`exts/cardiosolv.digitaltwin` turns the heart you select in an Omniverse / Isaac Sim stage into a
+biomechanical and electrophysiological digital twin and animates the results **on your own mesh**:
+anatomy discovery → myocardium / endocardium / epicardium / long axis → tetrahedral mesh + fibres →
+electrophysiology → Holzapfel-Ogden mechanics coupled to a Windkessel → a PyTorch port of the
+Cardio-PINN parametric surrogate (PhysicsNeMo backbone when available) → painted, animated twin.
+See [`exts/cardiosolv.digitaltwin/docs/README.md`](exts/cardiosolv.digitaltwin/docs/README.md).
+
+Note: in `Shape_model/LV_mean.vtk` the endocardium is **label 2** and the epicardium is **label 1**
+(the code above loads the pressure surface from label 2).

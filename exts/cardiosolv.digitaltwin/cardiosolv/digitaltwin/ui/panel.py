@@ -1,0 +1,472 @@
+"""CardioSolv panel: walk the digital-twin stages one by one on the selected heart."""
+
+from __future__ import annotations
+
+import asyncio
+import traceback
+from functools import partial
+
+import carb
+import carb.settings
+import numpy as np
+import omni.kit.app
+import omni.timeline
+import omni.ui as ui
+import omni.usd
+
+from ..core import anatomy as A
+from ..ep import PACING_PROTOCOLS
+from ..pipeline import STAGE_TITLES, STAGES, CardioSolvPipeline, PipelineConfig
+from ..usd.results_writer import FIELD_STYLE
+
+SETTINGS = "/exts/cardiosolv.digitaltwin"
+ROLE_CHOICES = ["(auto)", "Unknown"] + A.CARDIAC_STRUCTURES
+FIELDS = list(FIELD_STYLE)
+EP_SOLVERS = ["eikonal", "monodomain"]
+OK, WARN, ERR = 0xFF66CC66, 0xFF33BBFF, 0xFF5555FF
+
+
+def _combo_value(model):
+    return model.get_item_value_model().as_int
+
+
+class CardioSolvPanel:
+    def __init__(self, ext_id=""):
+        self.window = None
+        self.pipe: CardioSolvPipeline = None
+        self.cfg = PipelineConfig()
+        s = carb.settings.get_settings()
+        self.cfg.element_size_mm = s.get(f"{SETTINGS}/element_size_mm") or self.cfg.element_size_mm
+        self.cfg.slow_motion = s.get(f"{SETTINGS}/slow_motion") or self.cfg.slow_motion
+        self.cfg.device = s.get(f"{SETTINGS}/device") or self.cfg.device
+        self.source_path = None
+        self._busy = False
+        self._log_lines = []
+        self._labels = {}
+        self._frames = {}
+        self._progress = {}
+        self._parts_frame = None
+        self._plots_frame = {}
+        self._pending_progress = {}
+        self._log_dirty = False
+        self._update_sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
+            self._on_update, name="cardiosolv.ui")
+
+    # ------------------------------------------------------------------ UI
+    def show(self, *_):
+        if self.window:
+            self.window.visible = True
+            return
+        self.window = ui.Window("CardioSolv Digital Twin", width=520, height=900)
+        with self.window.frame:
+            with ui.ScrollingFrame():
+                with ui.VStack(spacing=6, height=0):
+                    ui.Label("CardioSolv  -  Cardiac Digital Twin", height=28, style={"font_size": 20})
+                    ui.Label("Select your heart root prim in the Stage, then run the stages in order. "
+                             "Nothing replaces your mesh: results are painted and animated on it via sublayers.",
+                             word_wrap=True, height=0, style={"color": 0xFFAAAAAA})
+                    with ui.HStack(height=26, spacing=6):
+                        ui.Button("Use Selected Heart", clicked_fn=self._use_selection, width=150)
+                        self._labels["source"] = ui.Label("Source: none", elided_text=True)
+                    with ui.HStack(height=26, spacing=6):
+                        ui.Button("Run All Stages", clicked_fn=lambda: self._spawn(self._run_all()))
+                        ui.Button("Clear Results", clicked_fn=self._clear_results, width=120)
+                    self._build_stage_discover()
+                    self._build_stage_geometry()
+                    self._build_stage_mesh()
+                    self._build_stage_ep()
+                    self._build_stage_mechanics()
+                    self._build_stage_surrogate()
+                    self._build_stage_twin()
+                    with ui.CollapsableFrame("Log", collapsed=False, height=0):
+                        self._labels["log"] = ui.Label("", word_wrap=True, height=0, style={"font_size": 13})
+
+    def _stage_header(self, name):
+        frame = ui.CollapsableFrame(STAGE_TITLES[name], collapsed=name not in ("discover",), height=0)
+        self._frames[name] = frame
+        return frame
+
+    def _status_row(self, name):
+        with ui.HStack(height=20, spacing=4):
+            self._labels[f"{name}_status"] = ui.Label("not run", width=0)
+            self._progress[name] = ui.ProgressBar(height=16)
+
+    def _float_field(self, label, value, key, width=90):
+        with ui.HStack(height=22):
+            ui.Label(label, width=220)
+            f = ui.FloatField(width=width)
+            f.model.set_value(float(value))
+            f.model.add_value_changed_fn(lambda m, k=key: self._set_cfg(k, m.as_float))
+        return f
+
+    def _set_cfg(self, key, value):
+        obj = self.cfg
+        parts = key.split(".")
+        for p in parts[:-1]:
+            obj = getattr(obj, p)
+        setattr(obj, parts[-1], value)
+
+    def _build_stage_discover(self):
+        with self._stage_header("discover"):
+            with ui.VStack(spacing=4, height=0):
+                ui.Label("Scans every mesh under the selected prim and scores each part against the "
+                         "cardiac vocabulary (names + hollowness + containment + contact).", word_wrap=True)
+                ui.Button("Discover Anatomy", height=26, clicked_fn=lambda: self._spawn(self._run_stage("discover")))
+                self._status_row("discover")
+                self._parts_frame = ui.Frame(height=0)
+
+    def _build_stage_geometry(self):
+        with self._stage_header("geometry"):
+            with ui.VStack(spacing=4, height=0):
+                self._float_field("Derived wall thickness (mm)", self.cfg.derived_wall_thickness_mm,
+                                  "derived_wall_thickness_mm")
+                with ui.HStack(height=22):
+                    ui.Label("Preview endo/epi colours on mesh", width=220)
+                    cb = ui.CheckBox()
+                    cb.model.set_value(self.cfg.preview_surface_colors)
+                    cb.model.add_value_changed_fn(lambda m: self._set_cfg("preview_surface_colors", m.as_bool))
+                ui.Button("Build Geometry Layer", height=26, clicked_fn=lambda: self._spawn(self._run_stage("geometry")))
+                self._status_row("geometry")
+                self._labels["geometry_info"] = ui.Label("", word_wrap=True, height=0)
+
+    def _build_stage_mesh(self):
+        with self._stage_header("mesh"):
+            with ui.VStack(spacing=4, height=0):
+                self._float_field("Element size (mm)", self.cfg.element_size_mm, "element_size_mm")
+                self._float_field("Endocardial helix angle (deg)", self.cfg.endo_helix_deg, "endo_helix_deg")
+                self._float_field("Epicardial helix angle (deg)", self.cfg.epi_helix_deg, "epi_helix_deg")
+                self._float_field("Sheet angle gamma (deg)", self.cfg.sheet_gamma_deg, "sheet_gamma_deg")
+                ui.Button("Build Mesh + Fibres", height=26, clicked_fn=lambda: self._spawn(self._run_stage("mesh")))
+                self._status_row("mesh")
+                self._labels["mesh_info"] = ui.Label("", word_wrap=True, height=0)
+
+    def _build_stage_ep(self):
+        with self._stage_header("ep"):
+            with ui.VStack(spacing=4, height=0):
+                protos = list(PACING_PROTOCOLS)
+                with ui.HStack(height=22):
+                    ui.Label("Scenario", width=220)
+                    c = ui.ComboBox(protos.index(self.cfg.ep.protocol), *protos)
+                    c.model.add_item_changed_fn(lambda m, _: self._set_cfg("ep.protocol", protos[_combo_value(m)]))
+                with ui.HStack(height=22):
+                    ui.Label("Solver", width=220)
+                    c = ui.ComboBox(0, *EP_SOLVERS)
+                    c.model.add_item_changed_fn(lambda m, _: self._set_cfg("ep.solver", EP_SOLVERS[_combo_value(m)]))
+                self._float_field("Fibre conduction velocity (mm/ms)", self.cfg.ep.cv_fiber, "ep.cv_fiber")
+                self._float_field("Cross-fibre CV (mm/ms)", self.cfg.ep.cv_cross, "ep.cv_cross")
+                ui.Button("Run Electrophysiology", height=26, clicked_fn=lambda: self._spawn(self._run_stage("ep")))
+                self._status_row("ep")
+                self._labels["ep_info"] = ui.Label("", word_wrap=True, height=0)
+                self._plots_frame["ep"] = ui.Frame(height=0)
+
+    def _build_stage_mechanics(self):
+        with self._stage_header("mechanics"):
+            with ui.VStack(spacing=4, height=0):
+                self._float_field("Peak active tension (kPa)", self.cfg.t_max_kpa, "t_max_kpa")
+                self._float_field("End-diastolic pressure (mmHg)", self.cfg.edp_mmhg, "edp_mmhg")
+                self._float_field("Peripheral resistance (mmHg s/mL)", self.cfg.r_periph, "r_periph")
+                self._float_field("Arterial compliance (mL/mmHg)", self.cfg.c_art, "c_art")
+                self._float_field("Cycle length (ms)", self.cfg.cycle_ms, "cycle_ms")
+                self._float_field("Time step (ms)", self.cfg.mechanics_dt_ms, "mechanics_dt_ms")
+                ui.Button("Simulate Heartbeat", height=26, clicked_fn=lambda: self._spawn(self._run_stage("mechanics")))
+                self._status_row("mechanics")
+                self._labels["mechanics_info"] = ui.Label("", word_wrap=True, height=0)
+                self._plots_frame["mechanics"] = ui.Frame(height=0)
+
+    def _build_stage_surrogate(self):
+        with self._stage_header("surrogate"):
+            with ui.VStack(spacing=4, height=0):
+                self._float_field("Training epochs", self.cfg.surrogate_epochs, "surrogate_epochs")
+                with ui.HStack(height=22):
+                    ui.Label("Target EF from echo (%, 0 = off)", width=220)
+                    f = ui.FloatField(width=90)
+                    f.model.set_value(0.0)
+                    f.model.add_value_changed_fn(lambda m: self._set_cfg("target_ef_pct", m.as_float or None))
+                with ui.HStack(height=22):
+                    ui.Label("Echo dashboard URL (optional)", width=220)
+                    sf = ui.StringField()
+                    sf.model.set_value(self.cfg.dashboard_url or "")
+                    sf.model.add_value_changed_fn(lambda m: self._set_cfg("dashboard_url", m.as_string or None))
+                ui.Button("Train Cardio-PINN Surrogate", height=26,
+                          clicked_fn=lambda: self._spawn(self._run_stage("surrogate")))
+                self._status_row("surrogate")
+                self._labels["surrogate_info"] = ui.Label("", word_wrap=True, height=0)
+                with ui.HStack(height=22):
+                    ui.Label("What-if contractility", width=220)
+                    sl = ui.FloatSlider(min=0.4, max=1.6)
+                    sl.model.set_value(1.0)
+                    sl.model.add_end_edit_fn(lambda m: self._what_if(m.as_float))
+                self._labels["whatif"] = ui.Label("", height=0)
+
+    def _build_stage_twin(self):
+        with self._stage_header("twin"):
+            with ui.VStack(spacing=4, height=0):
+                with ui.HStack(height=22):
+                    ui.Label("Field painted on your mesh", width=220)
+                    c = ui.ComboBox(FIELDS.index(self.cfg.display_field), *FIELDS)
+                    c.model.add_item_changed_fn(lambda m, _: self._repaint(FIELDS[_combo_value(m)]))
+                self._float_field("Slow motion factor", self.cfg.slow_motion, "slow_motion")
+                with ui.HStack(height=22):
+                    ui.Label("Animate neighbouring parts", width=220)
+                    cb = ui.CheckBox()
+                    cb.model.set_value(self.cfg.animate_neighbours)
+                    cb.model.add_value_changed_fn(lambda m: self._set_cfg("animate_neighbours", m.as_bool))
+                with ui.HStack(height=26, spacing=4):
+                    ui.Button("Build Twin on My Mesh", clicked_fn=lambda: self._spawn(self._run_stage("twin")))
+                    ui.Button("Play", width=60, clicked_fn=self._play)
+                self._status_row("twin")
+                self._labels["twin_info"] = ui.Label("", word_wrap=True, height=0)
+
+    # ------------------------------------------------------------ actions
+    def _use_selection(self):
+        ctx = omni.usd.get_context()
+        paths = ctx.get_selection().get_selected_prim_paths()
+        if len(paths) != 1:
+            self._log("Select exactly one heart root prim in the Stage window.")
+            return
+        if paths[0].startswith("/CardioSolv"):
+            self._log("CardioSolv cannot use its own generated hierarchy as source.")
+            return
+        self.source_path = paths[0]
+        self.pipe = CardioSolvPipeline(ctx.get_stage(), self.source_path, self.cfg, log=self._log,
+                                       progress=self._on_progress)
+        self._labels["source"].text = f"Source: {self.source_path}"
+        for name in STAGES:
+            self._set_status(name, "not run")
+        self._log(f"Source heart: {self.source_path}")
+
+    def _spawn(self, coro):
+        if self._busy:
+            self._log("A stage is already running.")
+            return
+        asyncio.ensure_future(coro)
+
+    async def _in_thread(self, fn, *args):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, partial(fn, *args))
+
+    async def _run_all(self):
+        for name in STAGES:
+            ok = await self._run_stage(name, chained=True)
+            if not ok:
+                break
+
+    async def _run_stage(self, name, chained=False):
+        if self.pipe is None:
+            self._use_selection()
+            if self.pipe is None:
+                return False
+        if self._busy and not chained:
+            return False
+        self._busy = True
+        self._set_status(name, "running...", WARN)
+        await omni.kit.app.get_app().next_update_async()
+        p = self.pipe
+        try:
+            if name == "discover":
+                from ..usd.scene_scanner import scan_heart
+
+                p.invalidate_after("discover")
+                p.scan = scan_heart(p.stage, p.source_path)  # USD read on main thread
+                await self._in_thread(p.compute_assignment)
+                p.done.append("discover")
+                self._show_parts()
+            elif name == "geometry":
+                p._require("discover")
+                p.invalidate_after("geometry")
+                await self._in_thread(p.compute_geometry)
+                p.write_geometry()  # USD authoring on main thread
+                p.done.append("geometry")
+                self._show_geometry()
+            elif name == "twin":
+                p.write_twin()
+                await self._in_thread(p.build_report)
+                files = await self._in_thread(p.export)
+                p.done.append("twin")
+                self._labels["twin_info"].text = f"Painted '{self.cfg.display_field}' and animated your mesh.\n" \
+                                                 f"Report: {files['report']}"
+                self._play()
+            else:
+                await self._in_thread(getattr(p, f"run_{name}"))
+                getattr(self, f"_show_{name}")()
+            self._set_status(name, "done", OK)
+            return True
+        except Exception as exc:
+            carb.log_error(traceback.format_exc())
+            self._set_status(name, f"error: {exc}", ERR)
+            self._log(f"ERROR in {name}: {exc}")
+            return False
+        finally:
+            self._busy = False
+
+    def _repaint(self, field):
+        self.cfg.display_field = field
+        if self.pipe and "twin" in self.pipe.done:
+            try:
+                lo, hi = self.pipe.repaint(field)
+                units = FIELD_STYLE[field][0]
+                self._labels["twin_info"].text = f"Showing {field}: {lo:.3g} .. {hi:.3g} {units}"
+            except Exception as exc:
+                self._log(f"repaint failed: {exc}")
+
+    def _play(self):
+        tl = omni.timeline.get_timeline_interface()
+        stage = omni.usd.get_context().get_stage()
+        tcps = stage.GetTimeCodesPerSecond() or 60.0
+        tl.set_start_time(stage.GetStartTimeCode() / tcps)
+        tl.set_end_time(stage.GetEndTimeCode() / tcps)
+        tl.set_looping(True)
+        tl.play()
+
+    def _clear_results(self):
+        if self.pipe and self.pipe.writer:
+            self.pipe.writer.clear()
+        stage = omni.usd.get_context().get_stage()
+        if stage and stage.GetPrimAtPath("/CardioSolv"):
+            from ..usd.layer import edit_context
+
+            with edit_context(stage):
+                stage.RemovePrim("/CardioSolv")
+        self._log("CardioSolv results removed from the stage (your mesh is untouched).")
+
+    def _what_if(self, scale):
+        p = self.pipe
+        if not p or p.surrogate is None:
+            return
+        from ..surrogate import simulate_cycle_surrogate
+
+        r = simulate_cycle_surrogate(p.surrogate, p._circulation(), scale)
+        m = r["metrics"]
+        self._labels["whatif"].text = (f"x{scale:.2f}: EF {m['ejection_fraction_pct']:.1f} %, SV "
+                                       f"{m['stroke_volume_ml']:.1f} mL, LVP {m['peak_lv_pressure_mmhg']:.0f} mmHg")
+
+    # ------------------------------------------------------------ displays
+    def _show_parts(self):
+        p = self.pipe
+        asg = p.assignment
+        role_of = {i: r for r, i in asg.roles.items()}
+        with self._parts_frame:
+            with ui.VStack(spacing=2, height=0):
+                for k, part in enumerate(p.scan.parts):
+                    role = role_of.get(k, "Unknown")
+                    score = asg.scores.get(role, 0.0)
+                    status = asg.status(role) if role in asg.roles else "-"
+                    color = OK if status in ("HIGH", "USER_CONFIRMED") else WARN if status != "-" else 0xFF888888
+                    with ui.HStack(height=22, spacing=4):
+                        ui.Label(part.source_path.split("/")[-1], width=170, elided_text=True,
+                                 tooltip=part.source_path)
+                        idx = ROLE_CHOICES.index(role) if role in ROLE_CHOICES else 1
+                        combo = ui.ComboBox(idx, *ROLE_CHOICES, width=170)
+                        combo.model.add_item_changed_fn(lambda m, _, k=k: self._override(k, ROLE_CHOICES[_combo_value(m)]))
+                        ui.Label(f"{score:.2f} {status}", style={"color": color})
+                for w in asg.warnings:
+                    ui.Label(f"! {w}", word_wrap=True, height=0, style={"color": WARN})
+
+    def _override(self, part_index, role):
+        if role in ("(auto)",):
+            for r, i in list(self.pipe.overrides.items()):
+                if i == part_index:
+                    self.pipe.set_role(r, None)
+        elif role != "Unknown":
+            self.pipe.set_role(role, part_index)
+        self._show_parts()
+        for name in STAGES[1:]:
+            self._set_status(name, "not run")
+
+    def _show_geometry(self):
+        g = self.pipe.geometry
+        v = self.pipe.validation
+        m = g.metrics
+        self._labels["geometry_info"].text = (
+            f"Myocardium: {m['myocardial_volume_ml']:.1f} mL ({g.myocardium_source}), mass {m['myocardial_mass_g']:.0f} g\n"
+            f"LV cavity: {m['lv_cavity_volume_ml']:.1f} mL, wall {m['mean_wall_thickness_mm']:.1f} mm\n"
+            f"Long axis: {m['long_axis_length_mm']:.1f} mm, confidence {g.long_axis.confidence:.2f} "
+            f"({', '.join(f'{x.name}:{x.sign:+.0f}' for x in g.long_axis.votes)})\n"
+            f"Surfaces: {g.to_dict()['surface_label_counts']}\nValidation: {v['status']}"
+            + "".join(f"\n! {w}" for w in v["warnings"][:6]))
+
+    def _show_mesh(self):
+        md = self.pipe.mesh.metadata
+        self._labels["mesh_info"].text = (f"{md['nodes']} nodes, {md['tets']} tets, {md['volume_ml']:.1f} mL; "
+                                          f"snap to your surface {md.get('snap_mean_distance_mm', 0):.2f} mm")
+
+    def _show_ep(self):
+        ep = self.pipe.ep
+        m = ep.metrics
+        self._labels["ep_info"].text = (f"QRS {m['qrs_duration_ms']:.0f} ms | total activation "
+                                        f"{m['total_activation_time_ms']:.0f} ms | septal->lateral "
+                                        f"{m['septal_to_lateral_delay_ms']:.0f} ms | APD {m['mean_apd_ms']:.0f} ms")
+        if ep.ecg:
+            with self._plots_frame["ep"]:
+                with ui.VStack(height=0):
+                    for name, sig in ep.ecg.items():
+                        ui.Label(f"pseudo-ECG {name}", height=16)
+                        ui.Plot(ui.Type.LINE, float(sig.min()), float(sig.max()), *sig.astype(float).tolist(),
+                                height=60, style={"color": 0xFF55FF55})
+
+    def _show_mechanics(self):
+        c = self.pipe.cycle
+        m = c.metrics
+        self._labels["mechanics_info"].text = (
+            f"EDV {m['edv_ml']:.1f} mL | ESV {m['esv_ml']:.1f} mL | SV {m['stroke_volume_ml']:.1f} mL | "
+            f"EF {m['ejection_fraction_pct']:.1f} %\nLVP max {m['peak_lv_pressure_mmhg']:.0f} mmHg | aortic "
+            f"{m['peak_aortic_pressure_mmhg']:.0f}/{m['min_aortic_pressure_mmhg']:.0f} mmHg | fibre strain "
+            f"{100 * m['peak_mean_fiber_strain']:.1f} %")
+        with self._plots_frame["mechanics"]:
+            with ui.VStack(height=0):
+                ui.Label("LV pressure (mmHg) over the beat", height=16)
+                ui.Plot(ui.Type.LINE, 0.0, float(c.pressure_mmhg.max()), *c.pressure_mmhg.astype(float).tolist(),
+                        height=70, style={"color": 0xFF5555FF})
+                ui.Label("LV volume (mL) over the beat", height=16)
+                ui.Plot(ui.Type.LINE, float(c.volume_ml.min()), float(c.volume_ml.max()),
+                        *c.volume_ml.astype(float).tolist(), height=70, style={"color": 0xFFFFAA44})
+
+    def _show_surrogate(self):
+        p = self.pipe
+        s = p.surrogate_cycle["metrics"]
+        txt = (f"{p.surrogate.backbone}: EF {s['ejection_fraction_pct']:.1f} % (FE "
+               f"{p.cycle.metrics['ejection_fraction_pct']:.1f} %), POD energy {p.surrogate.pod_energy:.5f}")
+        if p.calibration:
+            c = p.calibration
+            txt += (f"\nPersonalised: contractility x{c['contractility_scale']:.2f} "
+                    f"({c['t_max_kpa_personalised']:.0f} kPa) -> EF {c['achieved_ef_pct']:.1f} %")
+        self._labels["surrogate_info"].text = txt
+
+    def _show_twin(self):
+        pass
+
+    # ------------------------------------------------------------ helpers
+    def _on_progress(self, stage, frac):
+        # may be called from the worker thread: applied in _on_update on the main thread
+        self._pending_progress[stage] = float(np.clip(frac, 0, 1))
+
+    def _on_update(self, _event):
+        if self._pending_progress:
+            pending, self._pending_progress = self._pending_progress, {}
+            for stage, frac in pending.items():
+                bar = self._progress.get(stage)
+                if bar is not None:
+                    bar.model.set_value(frac)
+        if self._log_dirty:
+            self._log_dirty = False
+            lab = self._labels.get("log")
+            if lab:
+                lab.text = "\n".join(self._log_lines)
+
+    def _set_status(self, name, text, color=0xFFCCCCCC):
+        lab = self._labels.get(f"{name}_status")
+        if lab:
+            lab.text = text
+            lab.style = {"color": color}
+
+    def _log(self, msg):
+        carb.log_info(msg)
+        print(msg)
+        self._log_lines = (self._log_lines + [str(msg)])[-14:]
+        self._log_dirty = True
+
+    def destroy(self):
+        self._update_sub = None
+        if self.window:
+            self.window.destroy()
+            self.window = None

@@ -1,0 +1,119 @@
+# CardioSolv Digital Twin — Isaac Sim 6 extension
+
+CardioSolv turns **the heart you select in the stage** into a biomechanical and
+electrophysiological digital twin, and paints/animates the results **on your own
+mesh**. It never generates a replacement heart: your geometry is the source of
+truth, and every CardioSolv opinion lives in two sublayers that can be muted or
+deleted at any time.
+
+```
+Selected heart prim (your USD)
+   │  1 Anatomy discovery ── parts in world mm, explainable role scores (names + geometry)
+   │  2 Geometry layer ───── myocardium · endocardium / epicardium / base / RV-septum · long axis · landmarks
+   │  3 Mesh + fibres ────── conforming tets snapped to your surface · x_t, x_l, x_c · helix/sheet fibres
+   │  4 Electrophysiology ── eikonal or Mitchell–Schaeffer monodomain · sinus / LBBB / RV pacing / CRT · pseudo-ECG
+   │  5 Biomechanics ─────── Holzapfel–Ogden + EP-driven active tension + 3-element Windkessel heartbeat
+   │  6 Cardio-PINN ──────── parametric PINN surrogate (PhysicsNeMo backbone if installed) · EF personalisation
+   ▼  7 Twin on your mesh ── time-sampled points + colours on your prims · fibres · VTK / openCARP / JSON report
+```
+
+## Install
+
+1. Copy or symlink `exts/cardiosolv.digitaltwin` into an extension search path, or add
+   `<repo>/exts` under *Window → Extensions → ⚙ → Extension Search Paths*.
+2. Enable **CardioSolv Digital Twin** in the Extensions window
+   (*Window → CardioSolv Digital Twin* reopens the panel).
+3. Requirements: `numpy`, `scipy` (bundled with Isaac Sim) and `torch` (bundled with Isaac Sim;
+   needed for stages 5–6). Optional: `physicsnemo` (surrogate backbone), `gmsh` (graded meshing),
+   `vmtk` (vessel centrelines), openCARP (external EP using the exported files).
+
+## Use it
+
+1. Open your heart USD and select the **heart root prim** (the Xform holding the parts).
+2. *Use Selected Heart*, then run the stages in order (or *Run All Stages*).
+3. **Stage 1** lists every mesh part with the role CardioSolv assigned
+   (`Myocardium`, `LeftVentricle`, `RightVentricle`, `LeftAtrium`, `RightAtrium`, `Aorta`, …),
+   its score and confidence class. Use the combo boxes to correct any role; later stages re-run.
+4. **Stage 2** writes `/CardioSolv` (semantic `Scope`s, landmarks, long axis glyph) and adds
+   `cardiosolv_Endocardium / _Epicardium / _Base / _RVSeptum` **GeomSubsets on your myocardium mesh**,
+   with an optional colour preview.
+5. **Stages 3–6** compute (off the UI thread). Stage 6 can personalise contractility to a
+   measured EF (typed in, or fetched from the Echocardiology dashboard).
+6. **Stage 7** animates every part under your heart (the myocardium exactly, neighbours with a
+   distance fall-off) and paints the chosen field: activation time, transmembrane potential,
+   active tension, fibre strain, fibre stress, displacement. Press *Play*.
+
+Headless (Isaac Sim `python.sh`, or any Python with `usd-core`):
+
+```bash
+python scripts/run_pipeline.py heart.usd /World/Heart --protocol lbbb --target-ef 45 \
+    --dashboard http://localhost:3000
+```
+
+## How the geometry layer works on an imported multi-part heart
+
+* **Units / transforms** — every `UsdGeom.Mesh` under the selected prim (instance proxies and
+  face `GeomSubset` parts included) is triangulated and transformed to world millimetres using
+  `metersPerUnit`.
+* **Finding the myocardium** — parts are voxelised (3-axis parity vote: tolerant of holes and
+  non-manifold edges). A myocardial wall is recognised by *hollowness*: rays cast from its empty
+  interior hit the wall from most directions (enclosed cavity), and a blood-pool part sits inside
+  that cavity. Names (TotalSegmentator, VISTA-3D, MM-WHS, artist conventions) add evidence; anonymous
+  scenes (`Mesh_001…`) are scored on geometry only and never reported as HIGH confidence.
+  Without a myocardium part the LV wall is derived from the LV blood pool (flagged LOW).
+* **Endocardium vs epicardium** — each face of *your* myocardium is classified by the tissue on
+  its outward side: LV blood pool → endocardium, RV blood pool → RV septum, atria/great vessels or
+  the flat basal cut → base, otherwise epicardium; then majority-smoothed over neighbours.
+  Validated on Buoso's `Shape_model/LV_mean.vtk` (single anonymous prim, no blood pool):
+  **100 % of endocardial and epicardial ground-truth vertices** classified correctly.
+* **Long axis** — PCA axis whose apex/base sign is resolved by explicit votes (atria/great vessels,
+  cavity opening vs apical cap, base wider than apex), then refined as apex → centre of the basal
+  cavity opening. Matches the ground-truth apex→mitral axis of `LV_mean` (cos > 0.98).
+
+> Note: `LV_mean.vtk` stores the **endocardium as label 2** and the epicardium as label 1 (label 2
+> is the smaller inner shell, and `LoadModelAnatomy` takes the pressure surface from label 2). The
+> Cardio-PINN README lists them the other way round.
+
+## Physics
+
+| Stage | Model | Notes |
+|---|---|---|
+| Fibres | Cardio-PINN `GenerateFibers` (vectorised) | helix +60° endo → −60° epi, sheet γ = −65° |
+| EP | anisotropic eikonal (fast endocardial layer ≈ Purkinje) or Mitchell–Schaeffer monodomain | sinus QRS ≈ 70 ms, LBBB ≈ 170 ms, CRT resynchronises |
+| Passive | Holzapfel–Ogden, Sack et al. 2018 parameters (as Cardio-PINN), stiffness scale 0.75 | isochoric invariants + volumetric penalty |
+| Active | `T_a(x,t) = T_max · twitch(t − t_act(x))` along fibres | EP → mechanics coupling per element |
+| Circulation | 3-element Windkessel, implicit; isovolumetric phases by augmented Lagrangian | one energy minimisation per step |
+| Surrogate | Cardio-PINN parametric PINN: `(p, t, s) → POD amplitudes`, energy loss + FE anchors | PhysicsNeMo `FullyConnected` when available |
+
+On the bundled synthetic heart: EDV 79 mL, ESV 30 mL, **EF 62 %**, LV peak 131 mmHg,
+aortic 131/68 mmHg, peak fibre strain −15 %, myocardial volume preserved to 0.04 %.
+
+**Transverse active stress.** Cardio-PINN adds `0.3·((I4s−1)+(I4n−1))` to the active energy.
+With isochoric invariants this term behaves like an isotropic active stiffening that opposes wall
+thickening, and on the same anatomy it lowers EF from 62 % to 40 %. The default here is therefore
+`eta_transverse = 0`; set it to 0.3 to reproduce Cardio-PINN's formulation.
+
+## Outputs
+
+* `<stage>_cardiosolv.usda`: semantic layer, GeomSubsets, landmarks, axis.
+* `<stage>_cardiosolv_twin.usdc`: time-sampled points/colours/primvars on your prims, fibres.
+* `cardiosolv_output/cardiosolv_report.json`: anatomy, QC, EP, PV loop, surrogate, calibration.
+* `cardiosolv_output/opencarp/`: `.pts/.elem/.lon`, stimulus `.vtx`, `.par` template.
+* `cardiosolv_output/vtk/`: ParaView series (displacement, Vm, active tension, fibre strain/stress).
+
+## Tests
+
+```bash
+cd exts/cardiosolv.digitaltwin && pip install numpy scipy usd-core torch scikit-image vtk pytest
+python -m pytest
+```
+
+## Limitations (research prototype — not for clinical use)
+
+* LV only (the RV wall is not simulated); quasi-static mechanics; lumped (0D) haemodynamics
+  instead of 3D FSI.
+* P1 tetrahedra with a penalty volumetric term; refine elements for stress quantities.
+* Monodomain conduction velocity needs ≤ 1 mm elements to converge; the eikonal solver is the
+  interactive default.
+* If your heart asset is already animated (skinning/blend shapes), the twin's time samples override
+  its points while the twin layer is active.

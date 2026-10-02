@@ -1,0 +1,35 @@
+[package]
+version = "0.3.0"
+title = "CardioSolv Digital Twin"
+description = "Turns the heart you select in the stage into a biomechanical and electrophysiological digital twin: finds the myocardium, separates endo/epicardium, estimates the long axis, meshes, simulates (EP + Holzapfel-Ogden mechanics + Windkessel + Cardio-PINN surrogate) and paints/animates the results on your own mesh."
+category = "Simulation"
+keywords = ["cardiology", "digital twin", "heart", "medical", "biomechanics", "electrophysiology", "PINN", "USD"]
+authors = ["CardioSolv"]
+readme = "docs/README.md"
+changelog = "docs/CHANGELOG.md"
+repository = "https://github.com/islamsedibrahim/Cardio-PINN"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.usd" = {}
+"omni.ui" = {}
+"omni.timeline" = {}
+"omni.kit.menu.utils" = { optional = true }
+
+[[python.module]]
+name = "cardiosolv.digitaltwin"
+
+# scipy ships with Isaac Sim; listed so standalone Kit apps install it too.
+# PyTorch is bundled with Isaac Sim and is required for the biomechanics/surrogate stages.
+[python.pipapi]
+requirements = ["scipy"]
+use_online = true
+
+[settings]
+exts."cardiosolv.digitaltwin".element_size_mm = 3.0
+exts."cardiosolv.digitaltwin".slow_motion = 4.0
+exts."cardiosolv.digitaltwin".device = "auto"
+
+[[test]]
+dependencies = ["omni.kit.test"]
+args = ["--/app/file/ignoreUnsavedOnExit=true"]

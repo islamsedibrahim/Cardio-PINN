@@ -1,0 +1,322 @@
+"""Geometry layer: find the myocardium inside the user's mesh, separate
+endocardium / epicardium / base, and estimate the long axis.
+
+Input is the user's own anatomy (parts + role assignment); nothing is
+synthesised. If the heart has no explicit myocardium part, the LV wall is
+derived from the LV blood pool and its neighbours and flagged as such.
+
+Surface classes (shared by every later stage):
+    1 ENDO        LV endocardium (faces the LV blood pool)
+    2 EPI         epicardium
+    3 BASE        basal / valve plane
+    4 RV_SEPTUM   epicardial side of the septum facing the RV blood pool
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import numpy as np
+from scipy import ndimage
+
+from . import anatomy as A
+from .long_axis import LongAxis, estimate_long_axis
+from .mesh import SurfaceMesh, normalize
+from .voxel import VoxelGrid, dilate_mm, largest_component, voxelize
+
+UNKNOWN, ENDO, EPI, BASE, RV_SEPTUM = 0, 1, 2, 3, 4
+SURFACE_NAMES = {ENDO: "Endocardium", EPI: "Epicardium", BASE: "Base", RV_SEPTUM: "RVSeptum"}
+
+# voxel classes
+V_OUT, V_MYO, V_LVC, V_RVC, V_BASE_STRUCT, V_OTHER = 0, 1, 2, 3, 4, 5
+
+
+@dataclass
+class Landmark:
+    name: str
+    position: np.ndarray
+    confidence: float
+    method: str
+
+    def to_dict(self):
+        return {"name": self.name, "position": self.position.tolist(), "confidence": self.confidence,
+                "method": self.method}
+
+
+@dataclass
+class GeometryLayer:
+    grid: VoxelGrid
+    voxel_class: np.ndarray = field(repr=False)
+    myocardium_source: str  # "part" | "derived"
+    myocardium_part: Optional[int]
+    long_axis: LongAxis
+    septum_direction: np.ndarray
+    septum_confidence: float
+    landmarks: Dict[str, Landmark]
+    surface_labels: Optional[np.ndarray] = None  # per triangle of the myocardium part
+    metrics: Dict[str, float] = field(default_factory=dict)
+    confidence: Dict[str, float] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def myo(self):
+        return self.voxel_class == V_MYO
+
+    def to_dict(self):
+        return {
+            "grid": {"origin": self.grid.origin.tolist(), "spacing": self.grid.spacing, "shape": list(self.grid.shape)},
+            "myocardium_source": self.myocardium_source,
+            "long_axis": self.long_axis.to_dict(),
+            "septum_direction": self.septum_direction.tolist(),
+            "septum_confidence": self.septum_confidence,
+            "landmarks": {k: v.to_dict() for k, v in self.landmarks.items()},
+            "metrics": self.metrics,
+            "confidence": self.confidence,
+            "warnings": self.warnings,
+            "surface_label_counts": (
+                {SURFACE_NAMES.get(int(k), "Unknown"): int(v) for k, v in zip(*np.unique(self.surface_labels, return_counts=True))}
+                if self.surface_labels is not None else {}
+            ),
+        }
+
+
+def auto_spacing(meshes: List[SurfaceMesh], target_voxels=400_000, lo=0.6, hi=3.0) -> float:
+    bmin = np.min([m.bbox_min for m in meshes], axis=0)
+    bmax = np.max([m.bbox_max for m in meshes], axis=0)
+    vol = float(np.prod(np.maximum(bmax - bmin, 1e-3)))
+    return float(np.clip((vol / target_voxels) ** (1 / 3), lo, hi))
+
+
+def _centers(grid, mask):
+    return grid.centers(np.argwhere(mask))
+
+
+def label_surface_faces(mesh: SurfaceMesh, grid: VoxelGrid, vclass: np.ndarray, axis: LongAxis,
+                        smooth_iterations=3) -> np.ndarray:
+    """Classify each triangle of the user's myocardium surface.
+
+    The tissue on the outward side of each face decides its class: LV blood
+    pool -> ENDO, RV blood pool -> RV_SEPTUM, atria/great vessels -> BASE,
+    otherwise EPI. Faces on the flat basal cut (normal along the long axis at
+    the top of the ventricle) are BASE.
+    """
+    h = grid.spacing
+    c = mesh.face_centers()
+    n = mesh.face_normals()
+    off = 0.75 * h
+    plus, minus = c + n * off, c - n * off
+    cls_p = grid.sample(vclass, plus, fill=V_OUT)
+    cls_m = grid.sample(vclass, minus, fill=V_OUT)
+    # outward side = the side that is not myocardium (robust to flipped normals)
+    use_minus = (cls_p == V_MYO) & (cls_m != V_MYO)
+    outward_n = np.where(use_minus[:, None], -n, n)
+    # probe outward up to ~3.5 mm: segmentation parts often leave thin gaps
+    # between the wall and the neighbouring blood pools
+    outward_cls = np.full(mesh.n_faces, V_OUT, np.int8)
+    pending = np.ones(mesh.n_faces, bool)
+    for dist in (off, 1.5 * h, max(2.5 * h, 2.0), max(3.5 * h, 3.5)):
+        cls = grid.sample(vclass, c[pending] + outward_n[pending] * dist, fill=V_OUT)
+        hit = (cls != V_OUT) & (cls != V_MYO)
+        idx = np.nonzero(pending)[0]
+        outward_cls[idx[hit]] = cls[hit]
+        pending[idx[hit]] = False
+
+    labels = np.full(mesh.n_faces, UNKNOWN, np.int8)
+    labels[outward_cls == V_LVC] = ENDO
+    labels[outward_cls == V_RVC] = RV_SEPTUM
+    labels[outward_cls == V_BASE_STRUCT] = BASE
+    labels[(outward_cls == V_OUT) | (outward_cls == V_OTHER)] = EPI
+
+    # flat basal cut: normal along +axis near the top of the ventricle
+    xl = axis.project(c)
+    top = np.percentile(xl, 99.5)
+    basal = (outward_n @ axis.direction > 0.75) & (xl > top - 0.12)
+    labels[basal & (labels != ENDO)] = BASE
+    labels[basal & (labels == ENDO) & (outward_n @ axis.direction > 0.95) & (xl > top - 0.04)] = BASE
+
+    # majority smoothing over face neighbours
+    if smooth_iterations and mesh.n_faces > 10:
+        adj = mesh.face_adjacency()
+        for _ in range(smooth_iterations):
+            votes = np.zeros((mesh.n_faces, 5))
+            for k in range(5):
+                votes[:, k] = adj @ (labels == k).astype(float)
+            votes[:, UNKNOWN] = 0
+            votes[np.arange(mesh.n_faces), labels] += 0.9  # self-vote, avoids eroding thin bands
+            best = votes.argmax(1).astype(np.int8)
+            has = votes.max(1) > 0
+            labels = np.where(has, best, labels)
+    return labels
+
+
+def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spacing: Optional[float] = None,
+                         wall_thickness_mm: float = 10.0) -> GeometryLayer:
+    warnings: List[str] = []
+    role = asg.part
+    myo_i, lv_i, rv_i = role(A.MYOCARDIUM), role(A.LV), role(A.RV)
+    if myo_i is None and lv_i is None:
+        raise RuntimeError("Cannot locate the LV: no myocardium or LV blood pool part was identified. "
+                           "Assign the 'Myocardium' role manually in the CardioSolv panel.")
+
+    core = [parts[i] for i in (myo_i, lv_i, rv_i) if i is not None]
+    if spacing is None:
+        spacing = auto_spacing(core)
+    lo = np.min([m.bbox_min for m in core], axis=0)
+    hi = np.max([m.bbox_max for m in core], axis=0)
+    margin = 0.25 * float(np.max(hi - lo))
+    grid = VoxelGrid.around(lo - margin, hi + margin, spacing, padding_voxels=2)
+
+    def occ(r):
+        i = role(r)
+        return voxelize(parts[i], grid) if i is not None else np.zeros(grid.shape, bool)
+
+    lv_occ, rv_occ = occ(A.LV), occ(A.RV)
+    base_occ = occ(A.LA) | occ(A.AORTA) | occ(A.PA)
+    other_occ = occ(A.RA) | occ(A.RV_MYOCARDIUM)
+    epi_occ = occ(A.EPICARDIUM)
+
+    # ---------------- myocardium ----------------
+    if myo_i is not None:
+        myo = largest_component(voxelize(parts[myo_i], grid))
+        source = "part"
+        if myo.sum() < 50:
+            raise RuntimeError(f"Myocardium part {parts[myo_i].source_path} encloses almost no volume "
+                               f"({myo.sum()} voxels at {spacing:.2f} mm); is it an open sheet?")
+    else:
+        myo = dilate_mm(lv_occ, wall_thickness_mm, spacing) & ~lv_occ & ~rv_occ & ~base_occ & ~other_occ
+        if epi_occ.any():
+            myo &= epi_occ
+        myo = largest_component(myo)
+        source = "derived"
+        warnings.append(f"Myocardium derived from LV blood pool with {wall_thickness_mm:.0f} mm wall "
+                        f"(no myocardium part found): review before simulation.")
+
+    # ---------------- LV cavity ----------------
+    derived_cav = A.derive_cavity(myo, spacing)
+    if lv_i is not None:
+        lvc = lv_occ & ~myo
+        # close small gaps between wall and blood-pool surfaces
+        lvc |= derived_cav & ndimage.binary_dilation(lv_occ, iterations=2)
+        cav_method = "part"
+    else:
+        lvc = derived_cav & ~rv_occ & ~base_occ
+        lvc = largest_component(lvc) if lvc.any() else lvc
+        cav_method = "derived_enclosure"
+        if lvc.sum() < 20:
+            warnings.append("Could not find an LV cavity enclosed by the myocardium.")
+
+    if source == "derived":
+        # trim the dilation cap above the LV base
+        axis_tmp = estimate_long_axis(_centers(grid, myo), _centers(grid, lvc),
+                                      _centers(grid, base_occ) if base_occ.any() else None, spacing)
+        lim = (axis_tmp.base_center - axis_tmp.apex) @ axis_tmp.direction
+        proj = (_centers(grid, myo) - axis_tmp.apex) @ axis_tmp.direction
+        idx = np.argwhere(myo)
+        cut = idx[proj > lim + 0.5 * spacing]
+        myo[tuple(cut.T)] = False
+        myo = largest_component(myo)
+
+    # ---------------- voxel classes ----------------
+    vclass = np.zeros(grid.shape, np.int8)
+    vclass[other_occ | (epi_occ & ~myo)] = V_OTHER
+    vclass[base_occ] = V_BASE_STRUCT
+    vclass[rv_occ] = V_RVC
+    vclass[lvc] = V_LVC
+    vclass[myo] = V_MYO
+
+    # ---------------- long axis ----------------
+    myo_pts, cav_pts = _centers(grid, myo), _centers(grid, lvc)
+    base_pts = _centers(grid, base_occ) if base_occ.any() else None
+    axis = estimate_long_axis(myo_pts, cav_pts, base_pts, spacing)
+
+    # ---------------- septum direction ----------------
+    border = ndimage.binary_dilation(myo, iterations=2) & ~myo
+    rv_contact = border & rv_occ
+    sep_conf = 0.0
+    if rv_contact.sum() > 5:
+        sep_pt = _centers(grid, rv_contact).mean(0)
+        sep_conf = 0.9
+    elif rv_occ.any():
+        sep_pt = _centers(grid, rv_occ).mean(0)
+        sep_conf = 0.6
+    else:
+        from .mesh import pca_axes
+
+        _, ax, _ = pca_axes(myo_pts)
+        sep_pt = myo_pts.mean(0) + ax[1] * 10.0
+        sep_conf = 0.1
+        warnings.append("No RV found: circumferential reference (septum) is arbitrary.")
+    radial = sep_pt - axis.apex
+    radial -= (radial @ axis.direction) * axis.direction
+    septum_dir = normalize(radial)
+
+    # ---------------- surface labels on the user's myocardium ----------------
+    surface_labels = None
+    if myo_i is not None:
+        surface_labels = label_surface_faces(parts[myo_i], grid, vclass, axis)
+        counts = np.bincount(surface_labels, minlength=5)
+        if counts[ENDO] == 0:
+            warnings.append("No endocardial faces found on the myocardium part.")
+
+    # ---------------- landmarks ----------------
+    lms: Dict[str, Landmark] = {
+        "Apex": Landmark("Apex", axis.apex, axis.confidence, "epicardial extreme along long axis"),
+        "Base": Landmark("Base", axis.base_center, axis.confidence, "centre of basal LV cavity opening"),
+    }
+    if len(cav_pts):
+        pc = cav_pts @ axis.direction
+        lms["EndocardialApex"] = Landmark("EndocardialApex", cav_pts[pc <= np.percentile(pc, 1)].mean(0),
+                                          axis.confidence, "LV cavity extreme")
+    lv_border = ndimage.binary_dilation(lvc | myo, iterations=2)
+    for name, r in (("MitralAnnulus", A.LA), ("AorticAnnulus", A.AORTA)):
+        o = occ(r) if role(r) is not None else None
+        if o is not None:
+            contact = o & lv_border
+            if contact.sum() > 3:
+                lms[name] = Landmark(name, _centers(grid, contact).mean(0), 0.8, f"LV contact with {r}")
+    if "MitralAnnulus" not in lms:
+        lms["MitralAnnulus"] = Landmark("MitralAnnulus", axis.base_center, 0.4, "basal opening centre (no LA part)")
+    if rv_contact.sum() > 5:
+        lms["SeptumMid"] = Landmark("SeptumMid", _centers(grid, rv_contact).mean(0), 0.8, "LV wall contact with RV")
+
+    # ---------------- metrics & plausibility ----------------
+    h3 = spacing**3
+    myo_ml = myo.sum() * h3 / 1000.0
+    cav_ml = lvc.sum() * h3 / 1000.0
+    metrics = {
+        "voxel_spacing_mm": spacing,
+        "myocardial_volume_ml": myo_ml,
+        "myocardial_mass_g": myo_ml * 1.055,
+        "lv_cavity_volume_ml": cav_ml,
+        "long_axis_length_mm": axis.length_mm,
+    }
+    if myo_i is not None:
+        a = parts[myo_i].face_areas()
+        lab = surface_labels
+        metrics["endo_area_cm2"] = float(a[lab == ENDO].sum() / 100)
+        metrics["epi_area_cm2"] = float(a[(lab == EPI) | (lab == RV_SEPTUM)].sum() / 100)
+        mean_area = 0.5 * (metrics["endo_area_cm2"] + metrics["epi_area_cm2"]) * 100
+        metrics["mean_wall_thickness_mm"] = float(myo_ml * 1000 / max(mean_area, 1e-9))
+    else:
+        metrics["mean_wall_thickness_mm"] = wall_thickness_mm
+
+    checks = [("myocardial_mass_g", 40, 400), ("lv_cavity_volume_ml", 20, 400), ("long_axis_length_mm", 40, 160),
+              ("mean_wall_thickness_mm", 3, 25)]
+    for key, lo_v, hi_v in checks:
+        v = metrics.get(key)
+        if v is not None and not lo_v <= v <= hi_v:
+            warnings.append(f"{key} = {v:.1f} is outside the physiological range [{lo_v}, {hi_v}]; "
+                            f"check stage units (metersPerUnit) and part roles.")
+
+    myo_score = asg.scores.get(A.MYOCARDIUM, 0.45 if source == "derived" else 0.0)
+    conf = {
+        "myocardium": float(myo_score if source == "part" else min(myo_score, 0.45)),
+        "endocardium": 0.9 if cav_method == "part" else 0.7,
+        "long_axis": axis.confidence,
+        "septum": sep_conf,
+    }
+    return GeometryLayer(grid=grid, voxel_class=vclass, myocardium_source=source, myocardium_part=myo_i,
+                         long_axis=axis, septum_direction=septum_dir, septum_confidence=sep_conf, landmarks=lms,
+                         surface_labels=surface_labels, metrics=metrics, confidence=conf,
+                         warnings=warnings + list(asg.warnings))
