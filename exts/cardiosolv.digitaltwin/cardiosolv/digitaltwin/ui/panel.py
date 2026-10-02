@@ -214,6 +214,7 @@ class CardioSolvPanel:
                 with ui.HStack(height=26, spacing=4):
                     ui.Button("Build Twin on My Mesh", clicked_fn=lambda: self._spawn(self._run_stage("twin")))
                     ui.Button("Play", width=60, clicked_fn=self._play)
+                    ui.Button("Save Twin Stage", width=130, clicked_fn=self._save_twin_stage)
                 self._status_row("twin")
                 self._labels["twin_info"] = ui.Label("", word_wrap=True, height=0)
 
@@ -317,6 +318,16 @@ class CardioSolvPanel:
         tl.set_end_time(stage.GetEndTimeCode() / tcps)
         tl.set_looping(True)
         tl.play()
+
+    def _save_twin_stage(self):
+        if not self.pipe or "twin" not in self.pipe.done:
+            self._log("Build the twin first.")
+            return
+        try:
+            path = self.pipe.save_twin_stage()
+            self._labels["twin_info"].text += f"\nTwin stage: {path}"
+        except Exception as exc:
+            self._log(f"Saving twin stage failed: {exc}")
 
     def _clear_results(self):
         if self.pipe and self.pipe.writer:

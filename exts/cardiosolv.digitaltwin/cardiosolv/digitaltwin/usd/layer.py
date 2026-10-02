@@ -1,10 +1,15 @@
 """CardioSolv authoring layer.
 
 All CardioSolv opinions (semantic hierarchy, GeomSubsets on the user's mesh,
-simulation colours and animation) are written into one dedicated sublayer
-inserted at the strongest position of the root layer. The user's own asset
-files are never edited, and deleting/muting that sublayer restores the
-original heart exactly.
+simulation colours and animation) are written into dedicated sublayers of the
+root layer. The user's own asset files are never edited, and removing those
+sublayers restores the original heart exactly.
+
+USD rule to keep in mind: sublayers are weaker than the root layer itself. For
+hearts brought in by reference (the usual Isaac Sim case) the sublayers win;
+for meshes defined directly in the opened file the animation is authored in
+the session layer and ``results_writer.export_twin_stage`` saves a thin stage
+whose weakest sublayer is the original file.
 """
 
 from __future__ import annotations

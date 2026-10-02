@@ -42,8 +42,12 @@ class SurrogateConfig:
     p_max_mmhg: float = 180.0
     t_max_ms: float = 500.0
     s_range: tuple = (0.4, 1.6)
-    data_weight: float = 1.0  # FE-snapshot anchoring (0 = pure physics, as in Cardio-PINN)
+    # FE-equilibrium anchoring (0 = pure physics as in Cardio-PINN). The reduced energy is as
+    # ill-conditioned as the FE problem, so Adam alone under-converges; anchors fix the accuracy
+    # (EF error 33.6 vs 33.5 % at s=0.6, 63.5 vs 61.7 % at s=1) and physics interpolates between them.
+    data_weight: float = 300.0
     anchor_scales: tuple = (0.6, 1.4)  # extra FE equilibria at these contractilities
+    anchor_pressure_factors: tuple = (1.0,)  # ... at these fractions of the beat pressure (warm-started solves)
     anchor_times_ms: tuple = (100.0, 180.0, 260.0)
     use_physicsnemo: bool = True
     seed: int = 0
@@ -104,16 +108,17 @@ class CardioPINNSurrogate:
         beat = fe.times >= 0
         for s in cfg.anchor_scales:
             for t in cfg.anchor_times_ms:
-                k = int(np.argmin(np.abs(fe.times - t) + (~beat) * 1e9))
-                p = float(fe.pressure_mmhg[k])
-                u, _, _, _ = self.model.solve(fe.displacements[k], self.model.active_tension(t, s), "pressure",
-                                              p_pa=p * MMHG)
-                a = u.reshape(-1) @ self.Phi.cpu().numpy()
-                X.append(torch.tensor([[p / cfg.p_max_mmhg, t / cfg.t_max_ms, s]], dtype=self.model.dtype,
-                                      device=self.model.device))
-                Y.append(torch.as_tensor(a[None], dtype=self.model.dtype, device=self.model.device))
+                for pf in cfg.anchor_pressure_factors:
+                    k = int(np.argmin(np.abs(fe.times - t) + (~beat) * 1e9))
+                    p = float(fe.pressure_mmhg[k]) * pf
+                    u, _, _, _ = self.model.solve(fe.displacements[k], self.model.active_tension(t, s), "pressure",
+                                                  p_pa=p * MMHG)
+                    a = u.reshape(-1) @ self.Phi.cpu().numpy()
+                    X.append(torch.tensor([[p / cfg.p_max_mmhg, t / cfg.t_max_ms, s]], dtype=self.model.dtype,
+                                          device=self.model.device))
+                    Y.append(torch.as_tensor(a[None], dtype=self.model.dtype, device=self.model.device))
         self.anchor_x, self.anchor_a = torch.cat(X), torch.cat(Y)
-        log(f"surrogate: {len(self.anchor_x)} FE anchors ({len(cfg.anchor_scales) * len(cfg.anchor_times_ms)} new)")
+        log(f"surrogate: {len(self.anchor_x)} FE anchors ({len(cfg.anchor_scales) * len(cfg.anchor_times_ms) * len(cfg.anchor_pressure_factors)} new)")
 
     # ------------------------------------------------------------------
     def amplitudes(self, x):
@@ -192,7 +197,8 @@ def _secant(fun, x0, x1, tol=0.05, it=30):
     return x1
 
 
-def simulate_cycle_surrogate(sur: CardioPINNSurrogate, circ: CirculationParams = None, s_act=1.0, dt_ms=2.0):
+def simulate_cycle_surrogate(sur: CardioPINNSurrogate, circ: CirculationParams = None, s_act=1.0, dt_ms=5.0,
+                             min_ejection_ms=40.0):
     """Windkessel-coupled heartbeat using the surrogate's V(p, t, s) (milliseconds)."""
     circ = circ or CirculationParams()
     V = lambda p, t: sur.volume_ml(p, t, s_act)  # noqa: E731
@@ -201,6 +207,7 @@ def simulate_cycle_surrogate(sur: CardioPINNSurrogate, circ: CirculationParams =
     p, p_c, phase, v_prev, v_ref = circ.edp, circ.p_aortic_diastolic, "ivc", edv, edv
     beta = 1.0 / (1.0 + dt_ms / 1000.0 / (circ.r_periph * circ.c_art))
     t_fill, p_fill = None, None
+    t_eject, reverse_steps = None, 0
     n = int(circ.cycle_ms / dt_ms)
     for k in range(1, n + 1):
         t = k * dt_ms
@@ -210,7 +217,7 @@ def simulate_cycle_surrogate(sur: CardioPINNSurrogate, circ: CirculationParams =
                 v = V(p_new, t)
                 p_c_new = beta * p_c
                 if phase == "ivc" and p_new >= p_c_new:
-                    phase = "ejection"
+                    phase, t_eject, reverse_steps = "ejection", t, 0
                     continue
                 if phase == "ivr" and p_new <= circ.p_atrial:
                     phase, t_fill, p_fill = "filling", t, max(p_new, 1.0)
@@ -221,9 +228,13 @@ def simulate_cycle_surrogate(sur: CardioPINNSurrogate, circ: CirculationParams =
                 p_new = _secant(lambda q: q - a * (v_star - V(q, t)), p, p + 5.0)
                 v = V(p_new, t)
                 q_flow = (v_prev - v) / (dt_ms / 1000.0)
-                if q_flow < 0 and k > 2:
+                # the surrogate's V(p, t) carries small noise: close the aortic valve only on
+                # sustained reverse flow after a minimum ejection period
+                reverse_steps = reverse_steps + 1 if q_flow < 0 else 0
+                if reverse_steps >= 2 and t - t_eject >= min_ejection_ms:
                     phase, v_ref = "ivr", v_prev
                     continue
+                q_flow = max(q_flow, 0.0)
                 p_c_new = beta * (p_c + q_flow * dt_ms / 1000.0 / circ.c_art)
             else:
                 frac = min((t - t_fill) / max(circ.cycle_ms - t_fill, dt_ms), 1.0)

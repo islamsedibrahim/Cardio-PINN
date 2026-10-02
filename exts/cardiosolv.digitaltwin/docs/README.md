@@ -17,6 +17,8 @@ Selected heart prim (your USD)
    ▼  7 Twin on your mesh ── time-sampled points + colours on your prims · fibres · VTK / openCARP / JSON report
 ```
 
+![CardioSolv results on the bundled test heart](images/cardiosolv_results.png)
+
 ## Install
 
 1. Copy or symlink `exts/cardiosolv.digitaltwin` into an extension search path, or add
@@ -97,6 +99,13 @@ thickening, and on the same anatomy it lowers EF from 62 % to 40 %. The default 
 
 * `<stage>_cardiosolv.usda`: semantic layer, GeomSubsets, landmarks, axis.
 * `<stage>_cardiosolv_twin.usdc`: time-sampled points/colours/primvars on your prims, fibres.
+* `<stage>_twin.usda` (*Save Twin Stage* / CLI): a thin stage whose sublayers are
+  `[twin results, semantics, your original file]`. Open it to replay the twin; your file is untouched.
+
+USD layering note: sublayers are weaker than the root layer. When the heart is referenced into
+the scene (the usual Isaac Sim case) the CardioSolv sublayers override it directly. When the meshes
+are defined in the opened file itself, the live animation is authored in the session layer, and
+*Save Twin Stage* moves it into the twin layer underneath the thin stage.
 * `cardiosolv_output/cardiosolv_report.json`: anatomy, QC, EP, PV loop, surrogate, calibration.
 * `cardiosolv_output/opencarp/`: `.pts/.elem/.lon`, stimulus `.vtx`, `.par` template.
 * `cardiosolv_output/vtk/`: ParaView series (displacement, Vm, active tension, fibre strain/stress).
@@ -115,5 +124,8 @@ python -m pytest
 * P1 tetrahedra with a penalty volumetric term; refine elements for stress quantities.
 * Monodomain conduction velocity needs ≤ 1 mm elements to converge; the eikonal solver is the
   interactive default.
+* The surrogate matches FE ejection fraction (63.5 vs 61.7 %; 33.6 vs 33.5 % at 0.6× contractility,
+  mean volume error 0.9 mL) but can show pressure overshoots in early ejection; use the FE beat for
+  pressure waveforms. EF above ~65 % may be out of the calibratable range (reported as such).
 * If your heart asset is already animated (skinning/blend shapes), the twin's time samples override
   its points while the twin layer is active.

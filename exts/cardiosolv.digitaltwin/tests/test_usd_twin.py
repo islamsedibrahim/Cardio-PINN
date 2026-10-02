@@ -54,3 +54,14 @@ def test_twin_painted_and_animated_on_user_mesh(heart_pipeline):
     assert rv.GetPointsAttr().GetNumTimeSamples() == T  # neighbours follow too
     assert stage.GetRootLayer().ExportToString().count("timeSamples") == root_before.count("timeSamples")
     assert find_layer(stage, RESULTS_TAG) is not None
+
+
+def test_twin_stage_persists_animation(heart_pipeline, tmp_path):
+    p = heart_pipeline
+    out = p.save_twin_stage(str(tmp_path / "heart_twin.usda"))
+    st = Usd.Stage.Open(out)
+    myo = UsdGeom.Mesh(st.GetPrimAtPath("/World/Patient/Heart/heart_myocardium"))
+    assert myo.GetPointsAttr().GetNumTimeSamples() >= 3
+    assert st.GetPrimAtPath("/CardioSolv/Landmarks/Apex")
+    assert UsdGeom.GetStageMetersPerUnit(st) == 0.01
+    assert st.GetEndTimeCode() > st.GetStartTimeCode()

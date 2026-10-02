@@ -5,8 +5,8 @@ Plain USD:   python scripts/run_pipeline.py heart.usd /World/Heart --until ep
 
 The selected prim's meshes are analysed, simulated and painted in place: the
 results are authored into ``<stage>_cardiosolv.usda`` / ``<stage>_cardiosolv_twin.usdc``
-sublayers next to the stage, which is saved as ``<stage>_twin.usda`` unless
-``--in-place`` is given.
+sublayers next to the stage; ``<stage>_twin.usda`` opens the original (untouched)
+with the twin on top.
 """
 
 from __future__ import annotations
@@ -39,15 +39,9 @@ def main(argv=None):
     ap.add_argument("--role", action="append", default=[], help="override, e.g. Myocardium=/World/Heart/LV_wall")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dashboard", default=None, help="Echocardiology dashboard URL (echo EF in, report out)")
-    ap.add_argument("--in-place", action="store_true")
     args = ap.parse_args(argv)
 
     stage = Usd.Stage.Open(args.usd)
-    if not args.in_place:
-        stem, _ = os.path.splitext(args.usd)
-        out_path = f"{stem}_twin.usda"
-        stage.GetRootLayer().Export(out_path)
-        stage = Usd.Stage.Open(out_path)
     cfg = PipelineConfig(element_size_mm=args.element_size, mechanics_dt_ms=args.dt, target_ef_pct=args.target_ef,
                          surrogate_epochs=args.epochs, display_field=args.field, output_dir=args.out,
                          dashboard_url=args.dashboard)
@@ -70,8 +64,9 @@ def main(argv=None):
     if "twin" not in order:
         pipe.build_report()
         pipe.export()
-    stage.GetRootLayer().Save()
-    print(f"[CardioSolv] stage saved: {stage.GetRootLayer().realPath}")
+    else:
+        pipe.save_twin_stage()
+    # the original stage only gained sublayer references to the CardioSolv layers
     return pipe
 
 

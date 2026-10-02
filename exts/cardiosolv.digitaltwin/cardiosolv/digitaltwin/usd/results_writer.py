@@ -58,8 +58,12 @@ class TwinResultsWriter:
             world_mm = (np.c_[local, np.ones(len(local))] @ M)[:, :3] * mm
             is_myo = src.prim_path == myocardium_prim
             pmap = build_point_map(mesh, world_mm, falloff_mm=1e9 if is_myo else falloff_mm)
+            # Sublayers are weaker than the root layer: if the root layer itself authors this mesh's
+            # points, a sublayer cannot animate it, so the animation goes to the session layer
+            # (live view) and export_twin_stage() moves it into the twin layer for saving.
+            root_owned = bool(stage.GetRootLayer().GetAttributeAtPath(mesh_geom.GetPointsAttr().GetPath()))
             self.prims[src.prim_path] = {"geom": mesh_geom, "M_inv": np.linalg.inv(M), "world_mm": world_mm,
-                                         "map": pmap, "is_myo": is_myo, "n": len(local)}
+                                         "map": pmap, "is_myo": is_myo, "n": len(local), "root_owned": root_owned}
 
     def _ensure_strongest(self):
         root = self.stage.GetRootLayer()
@@ -82,22 +86,18 @@ class TwinResultsWriter:
         session = self.stage.GetSessionLayer()
         session.startTimeCode = float(codes[0])
         session.endTimeCode = float(codes[-1])
-        # Stage time range is only read from the root/session layers: author it on the root layer
-        # when the user's stage has none, so the twin still plays after saving and reopening.
-        root = self.stage.GetRootLayer()
-        if not root.HasStartTimeCode() or root.startTimeCode == root.endTimeCode:
-            root.startTimeCode = float(codes[0])
-            root.endTimeCode = float(codes[-1])
+        # (the stage range lives on root/session layers; export_twin_stage() persists it)
         self.layer.startTimeCode = float(codes[0])
         self.layer.endTimeCode = float(codes[-1])
 
     def write_animation(self, codes, nodal_u: np.ndarray, animate_neighbours=True):
         """``nodal_u`` (T,N,3) mm on the computational mesh."""
         mm = self.scan.mm_per_unit
-        with Usd.EditContext(self.stage, self.layer):
-            for path, info in self.prims.items():
-                if not info["is_myo"] and not animate_neighbours:
-                    continue
+        for path, info in self.prims.items():
+            if not info["is_myo"] and not animate_neighbours:
+                continue
+            target = self.stage.GetSessionLayer() if info["root_owned"] else self.layer
+            with Usd.EditContext(self.stage, target):
                 pts_attr = info["geom"].GetPointsAttr()
                 ext_attr = info["geom"].GetExtentAttr()
                 for code, u in zip(codes, nodal_u):
@@ -107,6 +107,9 @@ class TwinResultsWriter:
                     lo, hi = local.min(0), local.max(0)
                     ext_attr.Set(Vt.Vec3fArray([Gf.Vec3f(*lo.tolist()), Gf.Vec3f(*hi.tolist())]), Usd.TimeCode(float(code)))
         self.set_time_range(codes)
+
+    def root_owned_paths(self):
+        return [p for p, i in self.prims.items() if i["root_owned"]]
 
     def write_field(self, name, codes, nodal_values, vmin=None, vmax=None, cmap=None, all_parts=False):
         """Paint a nodal field (N,) static or (T,N) animated onto the user's meshes."""
@@ -168,8 +171,57 @@ class TwinResultsWriter:
 
     def clear(self):
         """Remove all CardioSolv result opinions (restores the original look/motion)."""
+        session = self.stage.GetSessionLayer()
         for path in self.prims:
             spec = self.layer.GetPrimAtPath(path)
             if spec:
                 parent = spec.nameParent
                 del parent.nameChildren[spec.name]
+            for attr in ("points", "extent"):
+                aspec = session.GetAttributeAtPath(Sdf.Path(path).AppendProperty(attr))
+                if aspec:
+                    aspec.owner.RemoveProperty(aspec)
+
+
+def export_twin_stage(stage: Usd.Stage, out_path: str, writer: "TwinResultsWriter" = None) -> str:
+    """Save a thin stage ``[twin results, CardioSolv semantics, original root]``.
+
+    The original file stays untouched and becomes the weakest sublayer, so the twin's
+    animation wins even for meshes defined directly in it.
+    """
+    import os
+
+    root = stage.GetRootLayer()
+    results = find_layer(stage, RESULTS_TAG)
+    semantic = find_layer(stage, LAYER_TAG)
+    if results is None:
+        raise RuntimeError("No CardioSolv twin layer on this stage; build the twin first.")
+    session = stage.GetSessionLayer()
+    if writer is not None:
+        for path in writer.root_owned_paths():
+            for attr in ("points", "extent"):
+                src = Sdf.Path(path).AppendProperty(attr)
+                if session.GetAttributeAtPath(src):
+                    Sdf.CreatePrimInLayer(results, path)
+                    Sdf.CopySpec(session, src, results, src)
+    results.startTimeCode = session.startTimeCode if session.HasStartTimeCode() else results.startTimeCode
+    results.endTimeCode = session.endTimeCode if session.HasEndTimeCode() else results.endTimeCode
+    for layer in (results, semantic):
+        if layer is not None and not layer.anonymous:
+            layer.Save()
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    twin = Sdf.Layer.CreateNew(out_path)
+    rel = lambda layer: os.path.relpath(layer.realPath, out_dir) if layer.realPath else layer.identifier  # noqa: E731
+    twin.subLayerPaths = [rel(l) for l in (results, semantic) if l is not None] + [rel(root)]
+    twin.startTimeCode, twin.endTimeCode = results.startTimeCode, results.endTimeCode
+    twin.timeCodesPerSecond = stage.GetTimeCodesPerSecond()
+    twin.framesPerSecond = stage.GetFramesPerSecond()
+    if root.defaultPrim:
+        twin.defaultPrim = root.defaultPrim
+    up = UsdGeom.GetStageUpAxis(stage)
+    twin.Save()
+    twin_stage = Usd.Stage.Open(out_path)
+    UsdGeom.SetStageUpAxis(twin_stage, up)
+    UsdGeom.SetStageMetersPerUnit(twin_stage, UsdGeom.GetStageMetersPerUnit(stage))
+    twin_stage.GetRootLayer().Save()
+    return out_path

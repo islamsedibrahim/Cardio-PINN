@@ -357,6 +357,18 @@ class CardioSolvPipeline:
         codes = self.writer.time_codes(times, self.cfg.slow_motion)
         return self.writer.write_field(field_name, codes, self.nodal_field(field_name))
 
+    def save_twin_stage(self, out_path=None):
+        """Write ``<stage>_twin.usda`` = [twin results, semantics, original stage] (original untouched)."""
+        from .usd.results_writer import export_twin_stage
+
+        if out_path is None:
+            root = self.stage.GetRootLayer()
+            stem = os.path.splitext(root.realPath)[0] if root.realPath else os.path.join(self.output_dir, "heart")
+            out_path = f"{stem}_twin.usda"
+        path = export_twin_stage(self.stage, out_path, self.writer)
+        self.log(f"[CardioSolv] twin stage saved: {path}")
+        return path
+
     def run_twin(self, export=True):
         self._require("ep")
 
