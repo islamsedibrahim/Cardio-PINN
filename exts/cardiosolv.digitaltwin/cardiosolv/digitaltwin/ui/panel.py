@@ -125,6 +125,17 @@ class CardioSolvPanel:
                     cb = ui.CheckBox()
                     cb.model.set_value(self.cfg.preview_surface_colors)
                     cb.model.add_value_changed_fn(lambda m: self._set_cfg("preview_surface_colors", m.as_bool))
+                with ui.HStack(height=22):
+                    ui.Label("Skin-only heart: derive interior", width=220)
+                    modes = ["auto", "on", "off"]
+                    c = ui.ComboBox(0, *modes)
+                    c.model.add_item_changed_fn(lambda m, _: self._set_cfg("skin_mode", modes[_combo_value(m)]))
+                for label, key in (("Skin mode: flip apex/base", "skin_flip_base"),
+                                   ("Skin mode: flip LV/RV side", "skin_flip_lv_side")):
+                    with ui.HStack(height=22):
+                        ui.Label(label, width=220)
+                        cb = ui.CheckBox()
+                        cb.model.add_value_changed_fn(lambda m, k=key: self._set_cfg(k, m.as_bool))
                 ui.Button("Build Geometry Layer", height=26, clicked_fn=lambda: self._spawn(self._run_stage("geometry")))
                 self._status_row("geometry")
                 self._labels["geometry_info"] = ui.Label("", word_wrap=True, height=0)
@@ -269,6 +280,7 @@ class CardioSolvPanel:
 
                 p.invalidate_after("discover")
                 p.scan = scan_heart(p.stage, p.source_path)  # USD read on main thread
+                p.prepare_scan()
                 await self._in_thread(p.compute_assignment)
                 p.done.append("discover")
                 self._show_parts()

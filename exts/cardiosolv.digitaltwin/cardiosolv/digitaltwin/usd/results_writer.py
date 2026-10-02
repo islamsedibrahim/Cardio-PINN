@@ -37,11 +37,18 @@ FIELD_STYLE = {
 
 class TwinResultsWriter:
     def __init__(self, stage: Usd.Stage, scan: SceneScan, mesh: TetMesh, myocardium_prim: Optional[str],
-                 falloff_mm=20.0):
+                 falloff_mm=20.0, paint_prims=None, paint_falloff_mm=3.0):
+        """Fields are computed in the simulation frame (``scan.to_sim``) and mapped back to world.
+
+        ``paint_prims``: prims painted besides the myocardium (e.g. the skin of a skin-only heart);
+        their colours fade to neutral grey where they are farther than ``paint_falloff_mm`` from
+        the simulated myocardium (RV free wall, atria)."""
         self.stage = stage
         self.scan = scan
         self.mesh = mesh
         self.myo_prim = myocardium_prim
+        self.paint_prims = set(paint_prims or [])
+        self.paint_falloff_mm = paint_falloff_mm
         self.layer = get_or_create_layer(stage, tag=RESULTS_TAG, ext="usdc")
         self._ensure_strongest()
         self.prims: Dict[str, dict] = {}
@@ -57,7 +64,7 @@ class TwinResultsWriter:
             M = np.asarray(src.world_matrix, float)
             world_mm = (np.c_[local, np.ones(len(local))] @ M)[:, :3] * mm
             is_myo = src.prim_path == myocardium_prim
-            pmap = build_point_map(mesh, world_mm, falloff_mm=1e9 if is_myo else falloff_mm)
+            pmap = build_point_map(mesh, scan.to_sim(world_mm), falloff_mm=1e9 if is_myo else falloff_mm)
             # Sublayers are weaker than the root layer: if the root layer itself authors this mesh's
             # points, a sublayer cannot animate it, so the animation goes to the session layer
             # (live view) and export_twin_stage() moves it into the twin layer for saving.
@@ -101,7 +108,7 @@ class TwinResultsWriter:
                 pts_attr = info["geom"].GetPointsAttr()
                 ext_attr = info["geom"].GetExtentAttr()
                 for code, u in zip(codes, nodal_u):
-                    world = info["world_mm"] + info["map"].apply_displacement(u)
+                    world = info["world_mm"] + info["map"].apply_displacement(u) / self.scan.sim_scale
                     local = (np.c_[world / mm, np.ones(len(world))] @ info["M_inv"])[:, :3].astype(np.float32)
                     pts_attr.Set(Vt.Vec3fArray.FromNumpy(local), Usd.TimeCode(float(code)))
                     lo, hi = local.min(0), local.max(0)
@@ -121,9 +128,15 @@ class TwinResultsWriter:
         cmap = cmap or FIELD_STYLE.get(name, ("", "turbo"))[1]
         with Usd.EditContext(self.stage, self.layer):
             for path, info in self.prims.items():
-                if not info["is_myo"] and not all_parts:
+                if not info["is_myo"] and not all_parts and path not in self.paint_prims:
                     continue
                 prim = info["geom"].GetPrim()
+                # fade to grey away from the simulated wall (sim-frame mm)
+                d = info["map"].distance
+                wgt = np.clip(1.0 - np.maximum(d - 0.5 * self.mesh.spacing, 0) / self.paint_falloff_mm, 0, 1)
+                wgt = wgt[:, None].astype(np.float32)
+                grey = np.float32(0.55)
+                paint = lambda v: colorize(v, vmin, vmax, cmap) * wgt + grey * (1 - wgt)  # noqa: E731
                 pv_api = UsdGeom.PrimvarsAPI(prim)
                 col = pv_api.CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex)
                 col.SetInterpolation(UsdGeom.Tokens.vertex)
@@ -131,12 +144,12 @@ class TwinResultsWriter:
                 col.GetAttr().Clear()
                 if static:
                     v = info["map"].apply(vals)
-                    col.Set(Vt.Vec3fArray.FromNumpy(colorize(v, vmin, vmax, cmap)))
+                    col.Set(Vt.Vec3fArray.FromNumpy(paint(v)))
                     raw.Set(Vt.FloatArray.FromNumpy(v.astype(np.float32)))
                 else:
                     for code, fv in zip(codes, vals):
                         v = info["map"].apply(fv)
-                        col.Set(Vt.Vec3fArray.FromNumpy(colorize(v, vmin, vmax, cmap)), Usd.TimeCode(float(code)))
+                        col.Set(Vt.Vec3fArray.FromNumpy(paint(v)), Usd.TimeCode(float(code)))
                         raw.Set(Vt.FloatArray.FromNumpy(v.astype(np.float32)), Usd.TimeCode(float(code)))
                 prim.SetCustomDataByKey("cardiosolv:displayed_field", name)
                 prim.SetCustomDataByKey("cardiosolv:displayed_range", Gf.Vec2d(vmin, vmax))
@@ -150,7 +163,7 @@ class TwinResultsWriter:
         c = self.mesh.points[self.mesh.tets[sel]].mean(1)
         f = coords.fiber[sel]
         half = 0.5 * length_factor * self.mesh.spacing
-        p0, p1 = (c - f * half) / mm, (c + f * half) / mm
+        p0, p1 = self.scan.to_world(c - f * half) / mm, self.scan.to_world(c + f * half) / mm
         pts = np.stack([p0, p1], 1).reshape(-1, 3).astype(np.float32)
         helix = np.degrees(np.arctan2(np.einsum("ij,ij->i", f, coords.e_l[sel]), np.einsum("ij,ij->i", f, coords.e_c[sel])))
         helix = (helix + 90) % 180 - 90
@@ -160,13 +173,34 @@ class TwinResultsWriter:
             curves.CreateTypeAttr(UsdGeom.Tokens.linear)
             curves.CreateCurveVertexCountsAttr(Vt.IntArray([2] * len(sel)))
             curves.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(pts))
-            curves.CreateWidthsAttr(Vt.FloatArray([0.25 / mm]))
+            curves.CreateWidthsAttr(Vt.FloatArray([0.25 / self.scan.sim_scale / mm]))
             curves.GetWidthsAttr().SetMetadata("interpolation", UsdGeom.Tokens.constant)
             pv = UsdGeom.PrimvarsAPI(curves.GetPrim()).CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray,
                                                                      UsdGeom.Tokens.uniform)
             pv.Set(Vt.Vec3fArray.FromNumpy(colors))
             curves.GetPrim().SetCustomDataByKey("cardiosolv:debug_visualization", True)
             UsdGeom.Imageable(curves.GetPrim()).CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+        return path
+
+    def write_assumed_endocardium(self, path="/CardioSolv/Debug/AssumedEndocardium"):
+        """Debug mesh of the derived (not imaged) LV endocardium - generated geometry, flagged as such."""
+        from ..core.geometry_layer import ENDO
+
+        faces = self.mesh.boundary_faces[self.mesh.face_labels == ENDO]
+        if len(faces) == 0:
+            return None
+        used, inv = np.unique(faces, return_inverse=True)
+        pts = self.scan.to_world(self.mesh.points[used]) / self.scan.mm_per_unit
+        with Usd.EditContext(self.stage, self.layer):
+            m = UsdGeom.Mesh.Define(self.stage, path)
+            m.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(pts.astype(np.float32)))
+            m.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(faces)))
+            m.CreateFaceVertexIndicesAttr(Vt.IntArray(inv.reshape(-1).astype(int).tolist()))
+            m.CreateDisplayColorAttr([Gf.Vec3f(0.95, 0.45, 0.45)])
+            m.CreateDisplayOpacityAttr([0.6])
+            m.GetPrim().SetCustomDataByKey("cardiosolv:generated", True)
+            m.GetPrim().SetCustomDataByKey("cardiosolv:assumed_anatomy", True)
+            m.GetPrim().SetCustomDataByKey("cardiosolv:debug_visualization", True)
         return path
 
     def clear(self):

@@ -58,6 +58,7 @@ class GeometryLayer:
     metrics: Dict[str, float] = field(default_factory=dict)
     confidence: Dict[str, float] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    skin: Optional[dict] = None  # skin-mode details (assumed anatomy)
 
     @property
     def myo(self):
@@ -74,6 +75,7 @@ class GeometryLayer:
             "metrics": self.metrics,
             "confidence": self.confidence,
             "warnings": self.warnings,
+            "skin_mode": self.skin,
             "surface_label_counts": (
                 {SURFACE_NAMES.get(int(k), "Unknown"): int(v) for k, v in zip(*np.unique(self.surface_labels, return_counts=True))}
                 if self.surface_labels is not None else {}
@@ -217,6 +219,21 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
         myo[tuple(cut.T)] = False
         myo = largest_component(myo)
 
+    return finalize_geometry_layer(
+        grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ, source=source, cav_method=cav_method,
+        myo_surface=parts[myo_i] if myo_i is not None else None, myo_part=myo_i,
+        myo_score=asg.scores.get(A.MYOCARDIUM, 0.45 if source == "derived" else 0.0),
+        named_base={name: occ(r) for name, r in (("MitralAnnulus", A.LA), ("AorticAnnulus", A.AORTA))
+                    if role(r) is not None},
+        wall_thickness_mm=wall_thickness_mm, warnings=warnings + list(asg.warnings))
+
+
+def finalize_geometry_layer(grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ, *, source, cav_method,
+                            myo_surface=None, myo_part=None, myo_score=0.0, named_base=None,
+                            wall_thickness_mm=10.0, warnings=None) -> GeometryLayer:
+    """Common tail of every geometry-layer mode: classes, long axis, septum, labels, landmarks, QC."""
+    warnings = list(warnings or [])
+    spacing = grid.spacing
     # ---------------- voxel classes ----------------
     vclass = np.zeros(grid.shape, np.int8)
     vclass[other_occ | (epi_occ & ~myo)] = V_OTHER
@@ -253,8 +270,8 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
 
     # ---------------- surface labels on the user's myocardium ----------------
     surface_labels = None
-    if myo_i is not None:
-        surface_labels = label_surface_faces(parts[myo_i], grid, vclass, axis)
+    if myo_surface is not None:
+        surface_labels = label_surface_faces(myo_surface, grid, vclass, axis)
         counts = np.bincount(surface_labels, minlength=5)
         if counts[ENDO] == 0:
             warnings.append("No endocardial faces found on the myocardium part.")
@@ -269,12 +286,10 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
         lms["EndocardialApex"] = Landmark("EndocardialApex", cav_pts[pc <= np.percentile(pc, 1)].mean(0),
                                           axis.confidence, "LV cavity extreme")
     lv_border = ndimage.binary_dilation(lvc | myo, iterations=2)
-    for name, r in (("MitralAnnulus", A.LA), ("AorticAnnulus", A.AORTA)):
-        o = occ(r) if role(r) is not None else None
-        if o is not None:
-            contact = o & lv_border
-            if contact.sum() > 3:
-                lms[name] = Landmark(name, _centers(grid, contact).mean(0), 0.8, f"LV contact with {r}")
+    for name, o in (named_base or {}).items():
+        contact = o & lv_border
+        if contact.sum() > 3:
+            lms[name] = Landmark(name, _centers(grid, contact).mean(0), 0.8, "LV contact with neighbouring part")
     if "MitralAnnulus" not in lms:
         lms["MitralAnnulus"] = Landmark("MitralAnnulus", axis.base_center, 0.4, "basal opening centre (no LA part)")
     if rv_contact.sum() > 5:
@@ -291,8 +306,8 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
         "lv_cavity_volume_ml": cav_ml,
         "long_axis_length_mm": axis.length_mm,
     }
-    if myo_i is not None:
-        a = parts[myo_i].face_areas()
+    if myo_surface is not None:
+        a = myo_surface.face_areas()
         lab = surface_labels
         metrics["endo_area_cm2"] = float(a[lab == ENDO].sum() / 100)
         metrics["epi_area_cm2"] = float(a[(lab == EPI) | (lab == RV_SEPTUM)].sum() / 100)
@@ -309,14 +324,12 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
             warnings.append(f"{key} = {v:.1f} is outside the physiological range [{lo_v}, {hi_v}]; "
                             f"check stage units (metersPerUnit) and part roles.")
 
-    myo_score = asg.scores.get(A.MYOCARDIUM, 0.45 if source == "derived" else 0.0)
     conf = {
         "myocardium": float(myo_score if source == "part" else min(myo_score, 0.45)),
-        "endocardium": 0.9 if cav_method == "part" else 0.7,
+        "endocardium": {"part": 0.9, "derived_enclosure": 0.7}.get(cav_method, 0.3),
         "long_axis": axis.confidence,
         "septum": sep_conf,
     }
-    return GeometryLayer(grid=grid, voxel_class=vclass, myocardium_source=source, myocardium_part=myo_i,
+    return GeometryLayer(grid=grid, voxel_class=vclass, myocardium_source=source, myocardium_part=myo_part,
                          long_axis=axis, septum_direction=septum_dir, septum_confidence=sep_conf, landmarks=lms,
-                         surface_labels=surface_labels, metrics=metrics, confidence=conf,
-                         warnings=warnings + list(asg.warnings))
+                         surface_labels=surface_labels, metrics=metrics, confidence=conf, warnings=warnings)

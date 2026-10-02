@@ -76,6 +76,29 @@ python scripts/run_pipeline.py heart.usd /World/Heart --protocol lbbb --target-e
 > is the smaller inner shell, and `LoadModelAnatomy` takes the pressure surface from label 2). The
 > Cardio-PINN README lists them the other way round.
 
+## Skin-only hearts and non-anatomical scale
+
+Many Omniverse heart assets (artist / generated / SimReady, e.g. `isaac_human_heart.usd`) are a single
+closed **outer skin**: rays through them cross the surface twice and the enclosed volume is solid, so
+there is no myocardium, chamber or septum to find. CardioSolv detects this (no wall-like part: local
+thickness > 25 mm at anatomical scale) and switches to **skin mode** (`skin_mode = auto | on | off`):
+
+* the skin is the epicardium; the base is the end whose cross-sections split into several great
+  vessels, the apex the single tapering tip (stage up-axis as a weak prior);
+* the AV plane is the waist of the cross-section area profile (fallback 62 % of the heart length);
+* the LV lies on the side the apex is offset to; a septal plane gives the LV ~62 % of the width;
+* walls use reference thicknesses (LV 10 mm, septum 10 mm, RV 4 mm);
+* the epicardial wall of the computational mesh is snapped to your skin, and your skin gets
+  `cardiosolv_LVEpicardium / _RVFreeWall / _AtriaGreatVessels` GeomSubsets;
+* results are painted on your skin (fading to grey over the RV free wall / atria, which follow the
+  motion), and the derived endocardium is shown as `/CardioSolv/Debug/AssumedEndocardium`.
+
+Everything derived is flagged **ASSUMED** and validation reports `REQUIRES ANATOMICAL VALIDATION`.
+Flip the apex/base or LV/RV sides from the panel if the asset is unusual.
+
+**Auto-scale**: assets outside 60–200 mm (the example heart is 1.1 m tall at `metersPerUnit = 1`)
+are simulated in an anatomical frame (heart length 120 mm) and mapped back at the displayed size.
+
 ## Physics
 
 | Stage | Model | Notes |

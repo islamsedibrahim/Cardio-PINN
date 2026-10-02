@@ -181,6 +181,8 @@ class PartFeatures:
     aspect: float  # sqrt(lambda1/lambda2) of voxel PCA
     centroid: np.ndarray
     hollow_ratio: float  # derived cavity volume / own volume
+    thickness_mm: float = 0.0  # local thickness (2 x 95th pct of the inner distance transform)
+    extent_mm: float = 1.0  # longest principal extent
     occupancy: np.ndarray = field(repr=False, default=None)
     cavity: np.ndarray = field(repr=False, default=None)
     contact: Dict[int, float] = field(default_factory=dict)  # boundary fraction touching part j
@@ -196,6 +198,8 @@ class PartFeatures:
             "manifold": self.is_manifold,
             "aspect": round(self.aspect, 2),
             "hollow_ratio": round(self.hollow_ratio, 3),
+            "local_thickness_mm": round(self.thickness_mm, 1),
+            "thickness_ratio": round(self.thickness_mm / max(self.extent_mm, 1e-9), 3),
         }
 
 
@@ -245,17 +249,23 @@ def compute_part_features(meshes: List[SurfaceMesh], grid: VoxelGrid,
         vol = float(occ.sum()) * h**3
         if occ.sum() >= 4:
             idx = np.argwhere(occ)
-            _, _, w = pca_axes(grid.centers(idx))
+            cpts = grid.centers(idx)
+            _, axes, w = pca_axes(cpts)
             aspect = float(np.sqrt(w[0] / max(w[1], 1e-9)))
-            centroid = grid.centers(idx).mean(0)
+            centroid = cpts.mean(0)
+            pr = (cpts - centroid) @ axes[0]
+            extent = float(pr.max() - pr.min())
+            edt = ndimage.distance_transform_edt(occ) * h
+            thickness = float(2 * np.percentile(edt[occ], 95))
         else:
-            aspect, centroid = 1.0, m.centroid
+            aspect, centroid, extent, thickness = 1.0, m.centroid, 1.0, 0.0
         topo = m.topology()
         cav = derive_cavity(occ, h) if vol > 0 else np.zeros_like(occ)
         feats.append(PartFeatures(
             index=i, path=m.source_path or m.name, volume_mm3=vol, surface_area_mm2=m.surface_area,
             is_closed=topo["is_closed"], is_manifold=topo["is_manifold"], aspect=aspect,
             centroid=centroid, hollow_ratio=float(cav.sum()) / max(occ.sum(), 1),
+            thickness_mm=thickness, extent_mm=extent,
             occupancy=occ, cavity=cav,
         ))
 
@@ -324,6 +334,12 @@ def score_part(f: PartFeatures, feats: List[PartFeatures]) -> List[AnatomicalCan
     c.add_evidence("closed", float(f.is_closed), 0.10, "Closed surface")
     if f.hollow_ratio < 0.05 and names[MYOCARDIUM] < 0.5:
         c.contradictions.append("No enclosed cavity: solid body, not a wall")
+    # parts are in anatomical mm (auto-scaled): a myocardial wall is ~8-16 mm, hypertrophy rarely > 25 mm
+    thick_ratio = f.thickness_mm / max(f.extent_mm, 1e-9)
+    c.add_evidence("thin_wall", float(np.clip((26.0 - f.thickness_mm) / 10.0, 0, 1)), 0.20,
+                   f"Local wall thickness {f.thickness_mm:.0f} mm ({100 * thick_ratio:.0f} % of its length)")
+    if f.thickness_mm > 25.0 and thick_ratio > 0.15 and names[MYOCARDIUM] < 1.0:
+        c.contradictions.append(f"Solid body {f.thickness_mm:.0f} mm thick: concavities, not a wall around a cavity")
 
     c = cand(LV)
     c.add_evidence("name", names[LV], 0.45, "USD name uses left-ventricle terminology")

@@ -108,9 +108,11 @@ def _surface_samples(surface: SurfaceMesh, density_mm: float):
     return np.vstack(pts)
 
 
-def snap_to_surface(mesh: TetMesh, surface: SurfaceMesh, max_move_factor=0.9, iterations=4):
-    """Move boundary nodes onto the user's surface without inverting tets."""
-    nodes = np.unique(mesh.boundary_faces)
+def snap_to_surface(mesh: TetMesh, surface: SurfaceMesh, max_move_factor=0.9, iterations=4, labels=None):
+    """Move boundary nodes (optionally only those on faces with ``labels``) onto the user's surface
+    without inverting tets."""
+    faces = mesh.boundary_faces if labels is None else mesh.boundary_faces[np.isin(mesh.face_labels, labels)]
+    nodes = np.unique(faces)
     samples = _surface_samples(surface, mesh.spacing)
     tree = cKDTree(samples)
     d, j = tree.query(mesh.points[nodes])
@@ -136,9 +138,11 @@ def snap_to_surface(mesh: TetMesh, surface: SurfaceMesh, max_move_factor=0.9, it
     return mesh
 
 
-def taubin_smooth_boundary(mesh: TetMesh, iterations=10, lam=0.5, mu=-0.53):
+def taubin_smooth_boundary(mesh: TetMesh, iterations=10, lam=0.5, mu=-0.53, fixed=None):
     faces = mesh.boundary_faces
     nodes = np.unique(faces)
+    if fixed is not None:
+        nodes = np.setdiff1d(nodes, fixed)
     import scipy.sparse as sp
 
     n = mesh.n_nodes
@@ -162,7 +166,9 @@ def taubin_smooth_boundary(mesh: TetMesh, iterations=10, lam=0.5, mu=-0.53):
 
 
 def build_tet_mesh(gl: GeometryLayer, myo_surface: Optional[SurfaceMesh], spacing_mm=2.5,
-                   mesher="voxel") -> TetMesh:
+                   mesher="voxel", skin_surface: Optional[SurfaceMesh] = None) -> TetMesh:
+    """``skin_surface``: skin-only hearts - only the epicardium is snapped to the user's skin,
+    the derived inner surfaces are smoothed."""
     if mesher == "gmsh":
         from ..io.external_tools import gmsh_tet_mesh
 
@@ -188,6 +194,9 @@ def build_tet_mesh(gl: GeometryLayer, myo_surface: Optional[SurfaceMesh], spacin
     mesh.face_labels = label_surface_faces(surf, gl.grid, gl.voxel_class, gl.long_axis)
     if myo_surface is not None:
         snap_to_surface(mesh, myo_surface)
+    elif skin_surface is not None:
+        taubin_smooth_boundary(mesh, fixed=mesh.node_set(EPI))
+        snap_to_surface(mesh, skin_surface, labels=(EPI,))
     else:
         taubin_smooth_boundary(mesh)
     vols = mesh.tet_volumes()

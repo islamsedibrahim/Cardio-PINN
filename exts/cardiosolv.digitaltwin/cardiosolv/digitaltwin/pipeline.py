@@ -46,6 +46,14 @@ STAGE_TITLES = {
 @dataclass
 class PipelineConfig:
     classification_voxels: int = 150_000
+    auto_scale: bool = True  # simulate non-anatomical assets (e.g. a 1.1 m heart) at heart size
+    anatomical_length_mm: float = 120.0
+    skin_mode: str = "auto"  # "auto" | "on" | "off": derive the interior of skin-only hearts
+    skin_lv_wall_mm: float = 10.0
+    skin_septum_mm: float = 10.0
+    skin_rv_wall_mm: float = 4.0
+    skin_flip_base: bool = False
+    skin_flip_lv_side: bool = False
     geometry_spacing_mm: Optional[float] = None  # auto
     derived_wall_thickness_mm: float = 10.0
     element_size_mm: float = 3.0
@@ -89,6 +97,7 @@ class CardioSolvPipeline:
         self.surrogate = self.surrogate_cycle = None
         self.calibration = None
         self.writer = None
+        self.skin_part = None
         self.report: dict = {}
 
     # ------------------------------------------------------------------
@@ -139,11 +148,35 @@ class CardioSolvPipeline:
             self.scan = scan_heart(self.stage, self.source_path)
             self.log(f"[CardioSolv] {len(self.scan.parts)} mesh parts under {self.source_path} "
                      f"(metersPerUnit={self.scan.meters_per_unit})")
+            self.prepare_scan()
             self.compute_assignment()
             return self.assignment
 
         self.invalidate_after("discover")
         return self._timed("discover", go)
+
+    def prepare_scan(self):
+        if self.cfg.auto_scale:
+            length = self.scan.heart_length_mm()
+            k = self.scan.apply_anatomical_scale(self.cfg.anatomical_length_mm)
+            if k != 1.0:
+                self.log(f"    heart is {length:.0f} mm long: simulating at {self.cfg.anatomical_length_mm:.0f} mm "
+                         f"(scale x{k:.4f}); results are mapped back at the displayed size")
+
+    def use_skin_mode(self) -> Optional[int]:
+        """Index of the skin part when the heart has no internal anatomy, else None."""
+        if self.cfg.skin_mode == "off":
+            return None
+        roles = self.assignment.roles
+        if self.cfg.skin_mode == "auto" and (A.MYOCARDIUM in roles or A.LV in roles):
+            return None
+        feats = self.assignment.features
+        big = max(feats, key=lambda f: f.volume_mm3)
+        total = sum(f.volume_mm3 for f in feats) or 1.0
+        # no myocardium / LV part: the heart is a skin if one part carries most of its volume
+        if self.cfg.skin_mode == "on" or big.volume_mm3 / total > 0.7:
+            return big.index
+        return None
 
     def compute_assignment(self):
         parts = self.scan.parts
@@ -172,10 +205,23 @@ class CardioSolvPipeline:
     # Stage 2
     # ------------------------------------------------------------------
     def compute_geometry(self):
-        self.geometry = build_geometry_layer(self.scan.parts, self.assignment, self.cfg.geometry_spacing_mm,
-                                             self.cfg.derived_wall_thickness_mm)
+        self.skin_part = self.use_skin_mode()
+        if self.skin_part is not None:
+            from .core.skin_mode import SkinModeParams, build_skin_geometry_layer
+
+            skin = self.scan.parts[self.skin_part]
+            self.log(f"    skin-only heart ({skin.source_path}): deriving an ASSUMED ventricular interior")
+            prm = SkinModeParams(spacing_mm=self.cfg.geometry_spacing_mm or 1.0, lv_wall_mm=self.cfg.skin_lv_wall_mm,
+                                 septum_mm=self.cfg.skin_septum_mm, rv_wall_mm=self.cfg.skin_rv_wall_mm,
+                                 flip_base=self.cfg.skin_flip_base, flip_lv_side=self.cfg.skin_flip_lv_side)
+            self.geometry = build_skin_geometry_layer(skin, self.scan.up_axis, prm)
+        else:
+            self.geometry = build_geometry_layer(self.scan.parts, self.assignment, self.cfg.geometry_spacing_mm,
+                                                 self.cfg.derived_wall_thickness_mm)
         self.canonical = build_canonical(self.source_path, self.scan.parts, self.scan.sources, self.assignment,
                                          self.geometry)
+        if self.skin_part is not None:
+            self._add_skin_surfaces()
         self.validation = self.canonical.validate()
         for w in self.validation["warnings"]:
             self.log(f"    warning: {w}")
@@ -184,12 +230,31 @@ class CardioSolvPipeline:
                  f"LV cavity {m['lv_cavity_volume_ml']:.1f} mL, long axis {m['long_axis_length_mm']:.1f} mm "
                  f"(conf {self.geometry.long_axis.confidence:.2f})")
 
+    def _add_skin_surfaces(self):
+        from .core.canonical import SurfaceComponent, faces_from_triangles
+        from .core.skin_mode import SKIN_NAMES, label_skin_faces
+
+        skin = self.scan.parts[self.skin_part]
+        src = self.scan.sources[self.skin_part]
+        lab = label_skin_faces(skin, self.geometry)
+        areas = skin.face_areas() / max(self.scan.sim_scale, 1e-12) ** 2
+        for code, name in SKIN_NAMES.items():
+            sel = lab == code
+            if sel.any():
+                self.canonical.surfaces[name] = SurfaceComponent(
+                    name=name, source_path=src.prim_path, component_type="assumed_" + name,
+                    confidence=0.3, face_indices=faces_from_triangles(lab, skin.tri_to_face, code),
+                    area_cm2=float(areas[sel].sum() / 100.0), metadata={"assumed": True})
+        self.canonical.metadata["skin_mode"] = self.geometry.skin
+        self.validation = self.canonical.validate()
+
     def write_geometry(self):
         from .usd.builder import CardioSolvUSDBuilder
         from .usd.layer import edit_context
 
         with edit_context(self.stage):
-            b = CardioSolvUSDBuilder(self.stage, self.scan.mm_per_unit)
+            b = CardioSolvUSDBuilder(self.stage, self.scan.mm_per_unit, to_world=self.scan.to_world,
+                                     length_scale=1.0 / self.scan.sim_scale)
             b.clear()
             b.build(self.canonical, self.assignment, self.validation, self.cfg.preview_surface_colors)
 
@@ -212,7 +277,8 @@ class CardioSolvPipeline:
         def go():
             gl = self.geometry
             myo_surface = self.scan.parts[gl.myocardium_part] if gl.myocardium_part is not None else None
-            self.mesh = build_tet_mesh(gl, myo_surface, self.cfg.element_size_mm, self.cfg.mesher)
+            skin = self.scan.parts[self.skin_part] if self.skin_part is not None else None
+            self.mesh = build_tet_mesh(gl, myo_surface, self.cfg.element_size_mm, self.cfg.mesher, skin_surface=skin)
             self.coords = compute_coordinates(self.mesh, gl, self.cfg.endo_helix_deg, self.cfg.epi_helix_deg,
                                               self.cfg.sheet_gamma_deg)
             md = self.mesh.metadata
@@ -339,7 +405,8 @@ class CardioSolvPipeline:
         if self.geometry.myocardium_part is not None:
             myo_prim = self.scan.sources[self.geometry.myocardium_part].prim_path
         if self.writer is None:
-            self.writer = TwinResultsWriter(self.stage, self.scan, self.mesh, myo_prim)
+            paint = [self.scan.sources[self.skin_part].prim_path] if getattr(self, "skin_part", None) is not None else None
+            self.writer = TwinResultsWriter(self.stage, self.scan, self.mesh, myo_prim, paint_prims=paint)
         times = self.frame_times()
         codes = self.writer.time_codes(times, self.cfg.slow_motion)
         if self.cycle is not None:
@@ -348,6 +415,8 @@ class CardioSolvPipeline:
             self.writer.set_time_range(codes)
         rng = self.writer.write_field(field_name, codes, self.nodal_field(field_name))
         self.writer.write_fibers(self.coords)
+        if self.geometry.myocardium_source != "part":
+            self.writer.write_assumed_endocardium()
         return codes, rng
 
     def repaint(self, field_name):
@@ -383,7 +452,9 @@ class CardioSolvPipeline:
     # ------------------------------------------------------------------
     def build_report(self):
         rep = {
-            "cardiosolv_version": "0.3.0",
+            "cardiosolv_version": "0.4.0",
+            "simulation_scale": self.scan.sim_scale if self.scan else 1.0,
+            "skin_mode": bool(getattr(self, "skin_part", None) is not None),
             "source_prim": self.source_path,
             "stage_file": self.stage.GetRootLayer().realPath or "",
             "timings_s": self.timings,

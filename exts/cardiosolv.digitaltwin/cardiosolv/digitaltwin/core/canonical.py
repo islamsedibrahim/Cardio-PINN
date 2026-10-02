@@ -73,7 +73,8 @@ class CanonicalHeartGeometry:
             errors.append("No source heart prim.")
         if "Myocardium" not in self.regions:
             errors.append("Myocardium region missing.")
-        for name in ("Epicardium", "Endocardium"):
+        expected = ("LVEpicardium",) if self.metadata.get("skin_mode") else ("Epicardium", "Endocardium")
+        for name in expected:
             if name not in self.surfaces:
                 warnings.append(f"{name} was not identified as a surface on the source mesh.")
         if "Apex" not in self.landmarks:

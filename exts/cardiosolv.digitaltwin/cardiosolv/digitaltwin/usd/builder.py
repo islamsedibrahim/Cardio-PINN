@@ -24,6 +24,9 @@ SURFACE_COLORS = {
     "Epicardium": (0.95, 0.75, 0.55),
     "Base": (0.30, 0.55, 0.95),
     "RVSeptum": (0.55, 0.30, 0.85),
+    "LVEpicardium": (0.85, 0.35, 0.30),
+    "RVFreeWall": (0.65, 0.55, 0.85),
+    "AtriaGreatVessels": (0.55, 0.65, 0.80),
 }
 LANDMARK_COLORS = {"Apex": (1.0, 0.85, 0.1), "Base": (0.1, 0.8, 1.0)}
 
@@ -38,12 +41,16 @@ def _vec(v):
 
 
 class CardioSolvUSDBuilder:
-    def __init__(self, stage: Usd.Stage, mm_per_unit: float):
+    def __init__(self, stage: Usd.Stage, mm_per_unit: float, to_world=None, length_scale=1.0):
+        """``to_world`` maps simulation-frame mm to world mm (auto-scaled assets); ``length_scale``
+        converts simulation lengths to world lengths for glyph sizes."""
         self.stage = stage
         self.mm_per_unit = float(mm_per_unit)
+        self.to_world = to_world or (lambda p: np.asarray(p, float))
+        self.length_scale = float(length_scale)
 
     def to_stage(self, p_mm):
-        return np.asarray(p_mm, float) / self.mm_per_unit
+        return self.to_world(np.asarray(p_mm, float)) / self.mm_per_unit
 
     # ------------------------------------------------------------------
     def create_structure(self):
@@ -144,7 +151,7 @@ class CardioSolvUSDBuilder:
         prim.SetCustomDataByKey("cardiosolv:confidence", float(lm.confidence))
         prim.SetCustomDataByKey("cardiosolv:method", str(lm.metadata.get("method", "")))
         sph = UsdGeom.Sphere.Define(self.stage, f"{path}/Glyph")
-        sph.GetRadiusAttr().Set(radius_mm / self.mm_per_unit)
+        sph.GetRadiusAttr().Set(radius_mm * self.length_scale / self.mm_per_unit)
         sph.GetDisplayColorAttr().Set([Gf.Vec3f(*LANDMARK_COLORS.get(lm.name, (0.2, 1.0, 0.4)))])
         sph.GetPrim().SetCustomDataByKey("cardiosolv:debug_visualization", True)
         return prim
@@ -160,13 +167,13 @@ class CardioSolvUSDBuilder:
         prim.SetCustomDataByKey("cardiosolv:origin_world", Gf.Vec3d(*origin.tolist()))
         prim.SetCustomDataByKey("cardiosolv:direction_world", Gf.Vec3d(*d.tolist()))
         prim.SetCustomDataByKey("cardiosolv:confidence", float(axis.confidence))
-        L = (length_mm or axis.metadata.get("length_mm", 40.0)) / self.mm_per_unit
+        L = (length_mm or axis.metadata.get("length_mm", 40.0)) * self.length_scale / self.mm_per_unit
         curve = UsdGeom.BasisCurves.Define(self.stage, f"{path}/Glyph")
         curve.CreateTypeAttr(UsdGeom.Tokens.linear)
         curve.CreateCurveVertexCountsAttr([2])
         p0, p1 = origin - 0.1 * L * d, origin + 1.15 * L * d
         curve.CreatePointsAttr([Gf.Vec3f(*p0), Gf.Vec3f(*p1)])
-        curve.CreateWidthsAttr([width_mm / self.mm_per_unit])
+        curve.CreateWidthsAttr([width_mm * self.length_scale / self.mm_per_unit])
         curve.GetDisplayColorAttr().Set([Gf.Vec3f(*color)])
         curve.GetPrim().SetCustomDataByKey("cardiosolv:debug_visualization", True)
         return prim

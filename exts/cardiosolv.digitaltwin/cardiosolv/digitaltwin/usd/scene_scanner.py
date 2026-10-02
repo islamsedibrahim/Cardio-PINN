@@ -38,10 +38,46 @@ class SceneScan:
     sources: List[MeshSource] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
     time_code: float = 0.0
+    # simulation frame: sim_mm = sim_center + sim_scale * (world_mm - sim_center)
+    sim_center: np.ndarray = None
+    sim_scale: float = 1.0
 
     @property
     def mm_per_unit(self):
         return self.meters_per_unit * 1000.0
+
+    def to_sim(self, world_mm):
+        if self.sim_scale == 1.0 or self.sim_center is None:
+            return np.asarray(world_mm, float)
+        return self.sim_center + self.sim_scale * (np.asarray(world_mm, float) - self.sim_center)
+
+    def to_world(self, sim_mm):
+        if self.sim_scale == 1.0 or self.sim_center is None:
+            return np.asarray(sim_mm, float)
+        return self.sim_center + (np.asarray(sim_mm, float) - self.sim_center) / self.sim_scale
+
+    def heart_length_mm(self):
+        """Longest principal extent of all parts (world mm)."""
+        from ..core.mesh import pca_axes
+
+        pts = np.vstack([m.points for m in self.parts])
+        c, ax, _ = pca_axes(pts[:: max(1, len(pts) // 50000)])
+        proj = (pts - c) @ ax[0]
+        return float(proj.max() - proj.min())
+
+    def apply_anatomical_scale(self, target_length_mm=120.0, accept=(60.0, 200.0)):
+        """Rescale non-anatomical assets (e.g. a 1.1 m heart) into a simulation frame.
+
+        Returns the factor applied (1.0 when the asset is already anatomical)."""
+        length = self.heart_length_mm()
+        if accept[0] <= length <= accept[1]:
+            return 1.0
+        pts = np.vstack([m.points for m in self.parts])
+        self.sim_center = pts.mean(0)
+        self.sim_scale = target_length_mm / length
+        for m in self.parts:
+            m.points = self.sim_center + self.sim_scale * (m.points - self.sim_center)
+        return self.sim_scale
 
 
 def _gf_matrix_to_np(m) -> np.ndarray:

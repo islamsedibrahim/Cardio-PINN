@@ -114,3 +114,33 @@ def write_lv_mean_usd(path, prim_name="Mesh_017"):
     m.CreateFaceVertexIndicesAttr(faces.reshape(-1).tolist())
     stage.GetRootLayer().Save()
     return path, labels
+
+
+def write_skin_only_heart_usd(path, scale=9.0):
+    """Single closed outer skin of the synthetic heart, ~1 m tall, metres (like generated SimReady assets)."""
+    masks, origin, h = synthetic_heart_masks()
+    union = np.zeros_like(masks["myo"])
+    for m in masks.values():
+        union |= m
+    # real hearts carry several great vessels at the base: add pulmonary trunk and SVC
+    ax = np.arange(-70, 100 + h, h)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij")
+    union |= ((X + 14) ** 2 + (Y + 16) ** 2 <= 10**2) & (Z >= 5) & (Z <= 85)  # pulmonary trunk
+    union |= ((X + 36) ** 2 + (Y - 6) ** 2 <= 8**2) & (Z >= 30) & (Z <= 80)  # superior vena cava
+    from scipy.ndimage import binary_closing, binary_fill_holes
+
+    union = binary_fill_holes(binary_closing(union, iterations=2))
+    v, f = _surface(union, origin, h, sigma=1.5)
+    stage = Usd.Stage.CreateNew(path)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    root = UsdGeom.Xform.Define(stage, "/root")
+    stage.SetDefaultPrim(root.GetPrim())
+    UsdGeom.Xform.Define(stage, "/root/Generate_a_SimReady")
+    UsdGeom.Xform.Define(stage, "/root/Generate_a_SimReady/Visuals")
+    m = UsdGeom.Mesh.Define(stage, "/root/Generate_a_SimReady/Visuals/Generate_a_SimReady_001")
+    m.CreatePointsAttr([Gf.Vec3f(*p) for p in (v * 0.001 * scale)])
+    m.CreateFaceVertexCountsAttr([3] * len(f))
+    m.CreateFaceVertexIndicesAttr(f.reshape(-1).tolist())
+    stage.GetRootLayer().Save()
+    return path
