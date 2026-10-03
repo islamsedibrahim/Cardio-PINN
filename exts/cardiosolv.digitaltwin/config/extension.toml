@@ -1,9 +1,9 @@
 [package]
-version = "0.4.0"
+version = "0.5.0"
 title = "CardioSolv Digital Twin"
 description = "Turns the heart you select in the stage into a biomechanical and electrophysiological digital twin: finds the myocardium, separates endo/epicardium, estimates the long axis, meshes, simulates (EP + Holzapfel-Ogden mechanics + Windkessel + Cardio-PINN surrogate) and paints/animates the results on your own mesh."
 category = "Simulation"
-keywords = ["cardiology", "digital twin", "heart", "medical", "biomechanics", "electrophysiology", "PINN", "USD"]
+keywords = ["DICOM", "segmentation", "cardiology", "digital twin", "heart", "medical", "biomechanics", "electrophysiology", "PINN", "USD"]
 authors = ["CardioSolv"]
 readme = "docs/README.md"
 changelog = "docs/CHANGELOG.md"
@@ -29,6 +29,11 @@ use_online = true
 exts."cardiosolv.digitaltwin".element_size_mm = 3.0
 exts."cardiosolv.digitaltwin".slow_motion = 4.0
 exts."cardiosolv.digitaltwin".device = "auto"
+# Stage 0 (DICOM -> heart USD): "local" runs cardiosolv-segment with imaging_python; "service" calls the REST API
+exts."cardiosolv.digitaltwin".imaging_mode = "local"
+exts."cardiosolv.digitaltwin".imaging_python = "python"
+exts."cardiosolv.digitaltwin".imaging_package_dir = ""
+exts."cardiosolv.digitaltwin".imaging_service_url = "http://localhost:8040"
 
 [[test]]
 dependencies = ["omni.kit.test"]

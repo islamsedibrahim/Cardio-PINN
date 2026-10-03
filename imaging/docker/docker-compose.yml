@@ -1,0 +1,23 @@
+services:
+  cardiosolv-imaging:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        TOTALSEG_LICENSE: ${TOTALSEG_LICENSE:-}
+    image: cardiosolv-imaging:0.1.0
+    ports:
+      - "8040:8040"
+    volumes:
+      - ./data:/data                         # job workspace (uploaded studies + results)
+    environment:
+      - TOTALSEG_LICENSE=${TOTALSEG_LICENSE:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    restart: unless-stopped

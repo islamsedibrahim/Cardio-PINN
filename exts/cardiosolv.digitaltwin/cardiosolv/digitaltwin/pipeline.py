@@ -33,6 +33,7 @@ from .ep import EPConfig, run_electrophysiology
 
 STAGES = ["discover", "geometry", "mesh", "ep", "mechanics", "surrogate", "twin"]
 STAGE_TITLES = {
+    "imaging": "0  Imaging: DICOM CT/MR -> 3D heart",
     "discover": "1  Anatomy discovery",
     "geometry": "2  Geometry layer (myocardium, endo/epi, long axis)",
     "mesh": "3  Computational mesh + fibres",

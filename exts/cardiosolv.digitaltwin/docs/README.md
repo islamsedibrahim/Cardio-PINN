@@ -7,6 +7,8 @@ truth, and every CardioSolv opinion lives in two sublayers that can be muted or
 deleted at any time.
 
 ```
+DICOM CT / MR  ── 0 Imaging ───────── NV-Segment-CTMR / TotalSegmentator -> heart.usda (imaging/ package)
+   │
 Selected heart prim (your USD)
    │  1 Anatomy discovery ── parts in world mm, explainable role scores (names + geometry)
    │  2 Geometry layer ───── myocardium · endocardium / epicardium / base / RV-septum · long axis · landmarks
@@ -18,6 +20,21 @@ Selected heart prim (your USD)
 ```
 
 ![CardioSolv results on the bundled test heart](images/cardiosolv_results.png)
+
+## Stage 0: from DICOM
+
+Install the segmentation package from `imaging/` on a GPU machine. Either install it locally
+with `pip install ".[nvsegment,totalsegmentator]"` and run `scripts/setup_models.sh`, or start
+it as a Docker service (see `imaging/README.md`). Then in the panel's **0 Imaging** section:
+
+1. Enter the DICOM folder, or a NIfTI file.
+2. Choose **local** (set *imaging Python* to that environment's interpreter) or **service**
+   (set *Service URL*, e.g. `http://gpu-host:8040`).
+3. Click **Segment & Load Heart**.
+
+The heart is referenced at `/World/CardioSolvPatient/Patient/Heart` and selected for Stage 1.
+Its parts are named `heart_myocardium`, `heart_ventricle_left`, ... so they are recognised with
+HIGH confidence.
 
 ## Install
 

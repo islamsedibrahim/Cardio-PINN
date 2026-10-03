@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+- Stage 0 imaging: DICOM CT / MR -> cardiovascular segmentation (NV-Segment-CTMR, TotalSegmentator
+  heartchambers_highres, or an existing label map) -> watertight heart USD, loaded by reference
+  into the stage (units and up-axis converted) and selected for Stage 1. Local subprocess or
+  REST service on a GPU host (`imaging/` deployable package).
+
 ## 0.4.0
 - Skin mode for skin-only hearts (visual/generated/SimReady assets): assumed LV/RV/septum under the
   user's surface, epicardium snapped to the skin, GeomSubsets and painting on the skin.

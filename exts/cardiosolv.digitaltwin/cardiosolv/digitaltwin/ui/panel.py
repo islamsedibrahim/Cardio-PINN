@@ -16,6 +16,7 @@ import omni.usd
 
 from ..core import anatomy as A
 from ..ep import PACING_PROTOCOLS
+from ..imaging_client import ImagingConfig, load_heart_into_stage, segment
 from ..pipeline import STAGE_TITLES, STAGES, CardioSolvPipeline, PipelineConfig
 from ..usd.results_writer import FIELD_STYLE
 
@@ -23,6 +24,9 @@ SETTINGS = "/exts/cardiosolv.digitaltwin"
 ROLE_CHOICES = ["(auto)", "Unknown"] + A.CARDIAC_STRUCTURES
 FIELDS = list(FIELD_STYLE)
 EP_SOLVERS = ["eikonal", "monodomain"]
+IMG_MODES = ["local", "service"]
+IMG_MODALITIES = ["auto", "CT", "MR"]
+IMG_ENGINES = ["auto", "nv-segment", "totalsegmentator", "both"]
 OK, WARN, ERR = 0xFF66CC66, 0xFF33BBFF, 0xFF5555FF
 
 
@@ -39,6 +43,12 @@ class CardioSolvPanel:
         self.cfg.element_size_mm = s.get(f"{SETTINGS}/element_size_mm") or self.cfg.element_size_mm
         self.cfg.slow_motion = s.get(f"{SETTINGS}/slow_motion") or self.cfg.slow_motion
         self.cfg.device = s.get(f"{SETTINGS}/device") or self.cfg.device
+        self.icfg = ImagingConfig(
+            mode=s.get(f"{SETTINGS}/imaging_mode") or "local",
+            python=s.get(f"{SETTINGS}/imaging_python") or "python",
+            package_dir=s.get(f"{SETTINGS}/imaging_package_dir") or None,
+            service_url=s.get(f"{SETTINGS}/imaging_service_url") or "http://localhost:8040")
+        self.imaging_input = ""
         self.source_path = None
         self._busy = False
         self._log_lines = []
@@ -71,6 +81,7 @@ class CardioSolvPanel:
                     with ui.HStack(height=26, spacing=6):
                         ui.Button("Run All Stages", clicked_fn=lambda: self._spawn(self._run_all()))
                         ui.Button("Clear Results", clicked_fn=self._clear_results, width=120)
+                    self._build_stage_imaging()
                     self._build_stage_discover()
                     self._build_stage_geometry()
                     self._build_stage_mesh()
@@ -82,7 +93,7 @@ class CardioSolvPanel:
                         self._labels["log"] = ui.Label("", word_wrap=True, height=0, style={"font_size": 13})
 
     def _stage_header(self, name):
-        frame = ui.CollapsableFrame(STAGE_TITLES[name], collapsed=name not in ("discover",), height=0)
+        frame = ui.CollapsableFrame(STAGE_TITLES[name], collapsed=name not in ("imaging", "discover"), height=0)
         self._frames[name] = frame
         return frame
 
@@ -105,6 +116,93 @@ class CardioSolvPanel:
         for p in parts[:-1]:
             obj = getattr(obj, p)
         setattr(obj, parts[-1], value)
+
+    def _string_field(self, label, value, setter):
+        with ui.HStack(height=22):
+            ui.Label(label, width=220)
+            f = ui.StringField()
+            f.model.set_value(value or "")
+            f.model.add_value_changed_fn(lambda m: setter(m.as_string))
+        return f
+
+    def _combo(self, label, options, current, setter):
+        with ui.HStack(height=22):
+            ui.Label(label, width=220)
+            c = ui.ComboBox(options.index(current) if current in options else 0, *options)
+            c.model.add_item_changed_fn(lambda m, _: setter(options[_combo_value(m)]))
+        return c
+
+    def _build_stage_imaging(self):
+        ic = self.icfg
+        with self._stage_header("imaging"):
+            with ui.VStack(spacing=4, height=0):
+                ui.Label("Segment the heart and great vessels from a CT or MR DICOM folder (or NIfTI) with "
+                         "NV-Segment-CTMR / TotalSegmentator, reconstruct it as USD and load it here. "
+                         "Skip this stage if your heart is already in the stage.", word_wrap=True)
+                self._string_field("DICOM folder / NIfTI / heart.usda", "", lambda v: setattr(self, "imaging_input", v))
+                self._combo("Run segmentation", IMG_MODES, ic.mode, lambda v: setattr(ic, "mode", v))
+                self._combo("Modality", IMG_MODALITIES, ic.modality, lambda v: setattr(ic, "modality", v))
+                self._combo("Engine", IMG_ENGINES, ic.engine, lambda v: setattr(ic, "engine", v))
+                self._string_field("Cine MR phase (ed / es / index)", ic.phase, lambda v: setattr(ic, "phase", v or "ed"))
+                self._string_field("Local: imaging Python", ic.python, lambda v: setattr(ic, "python", v or "python"))
+                self._string_field("Local: imaging package dir", ic.package_dir,
+                                   lambda v: setattr(ic, "package_dir", v or None))
+                self._string_field("Service URL", ic.service_url, lambda v: setattr(ic, "service_url", v))
+                with ui.HStack(height=26, spacing=4):
+                    ui.Button("Segment & Load Heart", clicked_fn=lambda: self._spawn(self._run_imaging()))
+                    ui.Button("Load heart.usda", width=130, clicked_fn=self._load_existing_heart)
+                self._status_row("imaging")
+                self._labels["imaging_info"] = ui.Label("", word_wrap=True, height=0)
+
+    async def _run_imaging(self):
+        import os
+
+        src = self.imaging_input.strip()
+        if not src or not os.path.exists(src):
+            self._log("Enter an existing DICOM folder or NIfTI file for Stage 0.")
+            return
+        self._busy = True
+        self._set_status("imaging", "segmenting...", WARN)
+        self._on_progress("imaging", 0.1)
+        try:
+            out = os.path.join(os.path.dirname(os.path.abspath(src.rstrip("/\\"))),
+                               "cardiosolv_imaging_" + os.path.basename(src.rstrip("/\\")).split(".")[0])
+            rep = await self._in_thread(segment, src, out, self.icfg, self._log)
+            self._on_progress("imaging", 0.9)
+            self._attach_heart(rep["outputs"]["usd"])
+            qc = rep.get("qc", {})
+            vols = ", ".join(f"{k.replace('heart_', '')} {v['volume_ml']:.0f} mL"
+                             for k, v in rep.get("structures", {}).items())
+            self._labels["imaging_info"].text = (f"{rep.get('modality', '')}: {qc.get('status', '')}\n{vols}"
+                                                 + "".join(f"\n! {w}" for w in qc.get("warnings", [])[:5]))
+            self._set_status("imaging", "done", OK)
+        except Exception as exc:
+            carb.log_error(traceback.format_exc())
+            self._set_status("imaging", f"error: {exc}", ERR)
+            self._log(f"ERROR in imaging: {exc}")
+        finally:
+            self._on_progress("imaging", 1.0)
+            self._busy = False
+
+    def _load_existing_heart(self):
+        import os
+
+        path = self.imaging_input.strip()
+        if not path.lower().endswith((".usd", ".usda", ".usdc", ".usdz")) or not os.path.isfile(path):
+            self._log("Enter the path of a heart.usda produced by cardiosolv-segment.")
+            return
+        try:
+            self._attach_heart(path)
+            self._set_status("imaging", "loaded", OK)
+        except Exception as exc:
+            self._set_status("imaging", f"error: {exc}", ERR)
+
+    def _attach_heart(self, usd_path):
+        ctx = omni.usd.get_context()
+        heart = load_heart_into_stage(ctx.get_stage(), usd_path)
+        ctx.get_selection().set_selected_prim_paths([heart], True)
+        self._use_selection()
+        self._log(f"Reconstructed heart loaded at {heart}; continue with Stage 1.")
 
     def _build_stage_discover(self):
         with self._stage_header("discover"):
