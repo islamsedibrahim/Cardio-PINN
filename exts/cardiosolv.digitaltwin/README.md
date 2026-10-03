@@ -52,8 +52,16 @@ The zip contains one folder, `cardiosolv.digitaltwin/`. Isaac Sim finds an exten
 4. The **CardioSolv Digital Twin** window docks on the right. A *CardioSolv* menu also appears in
    the menu bar (and *Window → CardioSolv Digital Twin*) to reopen it.
 
-**B. Script Editor (no settings)**: open `scripts/open_cardiosolv.py`, set `EXT_FOLDER` to the
-folder from step 1, paste it into *Window → Script Editor* and run it.
+**B. Script Editor (recommended on Windows)**: open `scripts/open_cardiosolv.py` from the zip, paste it
+into *Window → Script Editor* and run it. It finds the unzipped extension in Downloads, Documents,
+the Desktop or Isaac Sim's folders, including the extra folder level that *Extract All* creates. It
+copies the newest version to `Documents/Kit/shared/exts/cardiosolv.digitaltwin`, enables it and
+opens the window.
+
+Console warnings like `Extensions config 'extension.toml' doesn't exist '.../cardiosolv.digitaltwin-0.6.1'`
+come from a folder that holds the extension one level too deep (or from folders that are not
+extensions, such as `cardiosolv-imaging-*-deploy`, which belongs on the GPU host). They are
+harmless; delete or move those folders to silence them.
 
 **C. Command line**: `isaac-sim.sh --ext-folder ~/omni/exts --enable cardiosolv.digitaltwin`
 (on Windows, `isaac-sim.bat`).

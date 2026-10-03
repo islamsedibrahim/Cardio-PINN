@@ -1,31 +1,60 @@
-"""Open the CardioSolv panel from Isaac Sim's Script Editor (Window > Script Editor), no setup needed.
+"""Install / open CardioSolv from Isaac Sim's Script Editor (Window > Script Editor > paste > Run).
 
-1. Unzip cardiosolv.digitaltwin-<version>.zip anywhere, e.g. C:/omni/exts or ~/omni/exts.
-2. Set EXT_FOLDER below to the folder that CONTAINS the "cardiosolv.digitaltwin" folder.
-3. Paste this file into the Script Editor and press Run (Ctrl+Enter).
-
-It adds the folder to Kit's extension search paths, enables the extension and shows the window.
-Next time, the Extension Manager lists "CardioSolv Digital Twin" (tick AUTOLOAD to keep it on).
+Finds the extension wherever the zip was unpacked (Downloads, Documents, Isaac Sim's kit/exts, ...,
+including the extra folder level that Windows "Extract All" creates), copies the newest version to
+Documents/Kit/shared/exts/cardiosolv.digitaltwin (a standard search path), enables it and opens the window.
+Set SOURCE to the unzipped folder if it lives somewhere else.
 """
 
+import glob
 import os
+import re
+import shutil
+import sys
 
 import omni.kit.app
 
-EXT_FOLDER = r"C:/omni/exts"  # <-- the folder containing cardiosolv.digitaltwin/
+SOURCE = ""  # optional: folder where you unzipped cardiosolv.digitaltwin-<version>.zip
 EXT_ID = "cardiosolv.digitaltwin"
+HOME = os.path.expanduser("~")
+TARGET_ROOT = os.path.join(HOME, "Documents", "Kit", "shared", "exts")
 
-folder = os.path.abspath(os.path.expanduser(EXT_FOLDER))
-if os.path.isdir(os.path.join(folder, EXT_ID, EXT_ID)):  # zip unpacked one level deeper
-    folder = os.path.join(folder, EXT_ID)
-if not os.path.isfile(os.path.join(folder, EXT_ID, "config", "extension.toml")):
-    raise FileNotFoundError(f"{folder}/{EXT_ID}/config/extension.toml not found: set EXT_FOLDER to the folder "
-                            f"that contains the '{EXT_ID}' folder")
+
+def _version(toml):
+    m = re.search(r'^version\s*=\s*"([^"]+)"', open(toml, encoding="utf-8").read(), re.M)
+    return tuple(int(x) for x in re.findall(r"\d+", m.group(1))) if m else (0,)
+
+
+def _candidates():
+    roots = [SOURCE] if SOURCE else []
+    roots += [os.path.join(HOME, "Downloads"), os.path.join(HOME, "Documents"), os.path.join(HOME, "Desktop"),
+              TARGET_ROOT, os.path.dirname(omni.kit.app.get_app().get_app_filename() or "")]
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    roots += [exe_dir, os.path.dirname(exe_dir)]
+    found = set()
+    for r in filter(None, roots):
+        for depth in ("", "*", "*/*", "*/*/*", "*/*/*/*"):
+            found.update(glob.glob(os.path.join(r, depth, EXT_ID, "config", "extension.toml")))
+    return sorted(found, key=_version, reverse=True)
+
+
+cands = _candidates()
+if not cands:
+    raise FileNotFoundError("cardiosolv.digitaltwin/config/extension.toml not found: set SOURCE to the folder "
+                            "where you unzipped cardiosolv.digitaltwin-<version>.zip")
+src = os.path.dirname(os.path.dirname(cands[0]))
+dst = os.path.join(TARGET_ROOT, EXT_ID)
 mgr = omni.kit.app.get_app().get_extension_manager()
-mgr.add_path(folder)
+if os.path.abspath(src) != os.path.abspath(dst):
+    if mgr.is_extension_enabled(EXT_ID):
+        mgr.set_extension_enabled_immediate(EXT_ID, False)
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    print(f"[CardioSolv] installed {src} -> {dst}")
+mgr.add_path(TARGET_ROOT)
+mgr.refresh_registry() if hasattr(mgr, "refresh_registry") else None
 mgr.set_extension_enabled_immediate(EXT_ID, True)
 if not mgr.is_extension_enabled(EXT_ID):
-    raise RuntimeError("CardioSolv did not start: open Window > Console and look for [CardioSolv] errors")
-import cardiosolv.digitaltwin.extension  # noqa: E402,F401  (now importable)
-
-print("[CardioSolv] enabled from", folder, "- the window is docked on the right (Window > CardioSolv Digital Twin)")
+    raise RuntimeError("CardioSolv did not start: Window > Console, filter 'CardioSolv' for the error")
+print("[CardioSolv] enabled - window docked on the right; reopen it from the CardioSolv menu. "
+      "Tick AUTOLOAD in Window > Extensions to start it with Isaac Sim.")

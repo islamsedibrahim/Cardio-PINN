@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2
+- `scripts/open_cardiosolv.py` locates the unzipped extension by itself (also one level deeper),
+  installs the newest copy into `Documents/Kit/shared/exts` and enables it.
+- Removed the no-op `[python.pipapi]` entry (Kit warning); install notes on nested-folder warnings.
+
 ## 0.6.1
 - **Patient data** form at the top of the panel (DICOM / NIfTI / heart.usda and LGE with *Browse*,
   heart rate, aortic diastolic pressure, LV / RV EDP, measured LVEDV and LVEF, geometry state,
