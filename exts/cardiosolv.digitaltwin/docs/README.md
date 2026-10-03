@@ -55,8 +55,10 @@ The zip contains one folder, `cardiosolv.digitaltwin/`. Isaac Sim finds an exten
 **B. Script Editor (recommended on Windows)**: open `scripts/open_cardiosolv.py` from the zip, paste it
 into *Window → Script Editor* and run it. It finds the unzipped extension in Downloads, Documents,
 the Desktop or Isaac Sim's folders, including the extra folder level that *Extract All* creates. It
-copies the newest version to `Documents/Kit/shared/exts/cardiosolv.digitaltwin`, enables it and
-opens the window.
+copies the newest version to `Documents/Kit/shared/exts/cardiosolv.digitaltwin`, unregisters every
+other copy (two copies of the same extension make Kit fail with `KeyError ... fast_importer.remove_sys_path`),
+lists those copies for you to delete (`CLEAN = True` deletes them), and turns AUTOLOAD on. Then it
+enables the extension, or asks you to restart Isaac Sim if a CardioSolv copy was already loaded.
 
 Console warnings like `Extensions config 'extension.toml' doesn't exist '.../cardiosolv.digitaltwin-0.6.1'`
 come from a folder that holds the extension one level too deep (or from folders that are not
