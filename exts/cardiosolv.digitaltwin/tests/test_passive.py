@@ -12,7 +12,9 @@ def test_klotz_relation():
     v, v0, v30 = klotz_edpvr(120.0, 12.0)
     assert v0 == pytest.approx(klotz_v0(120.0, 12.0)) == pytest.approx(120 * (0.6 - 0.072))
     assert np.interp(12.0, [0, 5, 10, 15, 20, 25, 30], v) == pytest.approx(120.0, rel=0.02)  # passes through (EDV, EDP)
-    assert v[-1] == pytest.approx(v30) and np.all(np.diff(v) > 0)
+    # Klotz normalisation: EDVn = (V - V0)/(V30 - V0) = (P / 27.78)^(1/2.76), so V(27.78 mmHg) = V30
+    assert v[-1] == pytest.approx(v0 + (v30 - v0) * (30 / KLOTZ_AN) ** (1 / 2.76)) and np.all(np.diff(v) > 0)
+    assert klotz_edpvr(120.0, 12.0, [KLOTZ_AN])[0][0] == pytest.approx(v30)
 
 
 def test_unload_reproduces_image(heart_pipeline):
