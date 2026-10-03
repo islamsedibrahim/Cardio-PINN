@@ -39,13 +39,16 @@ def choose_engines(engine: str, modality: str) -> List[str]:
 
 
 def run(input_path, out_dir, modality: str = "auto", engine: str = "auto", label_map: Optional[str] = None,
-        mapping=None, phase: str = "ed", iso_mm: float = 1.0, device: str = "gpu", log=print) -> dict:
+        mapping=None, phase: str = "ed", iso_mm: float = 1.0, device: str = "gpu", log=print,
+        lge: Optional[str] = None, scar_method: str = "nsd", scar_n_sd: float = 3.0,
+        scar_labels: Optional[str] = None) -> dict:
+    """``lge``: LGE MR (DICOM folder or NIfTI) of the same examination -> scar meshes in heart.usda."""
     import nibabel as nib
 
     t0 = time.time()
     inp, out = Path(input_path), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    report = {"cardiosolv_imaging": "0.1.0", "steps": {}}
+    report = {"cardiosolv_imaging": "0.2.0", "steps": {}}
 
     # 1. DICOM -> NIfTI ---------------------------------------------------
     if _is_nifti(inp):
@@ -111,12 +114,46 @@ def run(input_path, out_dir, modality: str = "auto", engine: str = "auto", label
                               **({"cleanup": cleanup[s.name]} if s.name in cleanup else {})}
     if not surfaces:
         raise RuntimeError("Segmentation contains no cardiac structures.")
+
+    # 5. scar from LGE (optional) ---------------------------------------------
+    scar_surfaces = {}
+    if lge or scar_labels:
+        from .scar import BZ, CORE, segment_scar
+
+        myo_lab = L.BY_NAME["heart_myocardium"].label
+        if not (fused_iso == myo_lab).any():
+            raise RuntimeError("LGE scar needs the LV myocardium in the anatomical segmentation.")
+        lge_path = lge
+        if lge and not _is_nifti(Path(lge)):
+            from .dicom_io import dicom_to_nifti
+
+            info = dicom_to_nifti(Path(lge), out / "lge.nii.gz", "MR", "ed")
+            lge_path = info["nifti"]
+            report["steps"]["lge_dicom"] = info
+        blood = np.isin(fused_iso, [L.BY_NAME[n].label for n in ("heart_ventricle_left", "heart_ventricle_right")])
+        log("[imaging] segmenting LGE scar ...")
+        scar_iso, scar_info = segment_scar(lge_path or image, fused_iso == myo_lab, aff_iso, blood, scar_method,
+                                           scar_n_sd, scar_labels)
+        nib.save(nib.Nifti1Image(scar_iso.astype(np.int16), aff_iso), str(out / "scar_labels.nii.gz"))
+        for name, m in (("scar_core", scar_iso == CORE), ("scar_border_zone", scar_iso == BZ)):
+            if m.sum() < 5:
+                continue
+            pts, faces = mask_to_surface(m, aff_iso)
+            if pts is not None:
+                scar_surfaces[name] = (pts, faces)
+        report["scar"] = scar_info
+        log(f"[imaging] scar: core {scar_info['core_volume_ml']} mL, border zone {scar_info['border_zone_volume_ml']} mL "
+            f"({scar_info['scar_burden_pct']} % of the LV myocardium)")
+
     usd_path = write_heart_usd(out / "heart.usda", surfaces,
-                               {"modality": mod, "engines": "+".join(r.engine for r in results), "phase": phase})
+                               {"modality": mod, "engines": "+".join(r.engine for r in results), "phase": phase},
+                               scar_surfaces=scar_surfaces)
     report["structures"] = structures
     report["qc"] = assess(structures, mod)
     report["outputs"] = {"usd": usd_path, "label_map": str(out / "heart_labels.nii.gz"), "image": str(image),
                          "heart_prim": "/World/Patient/Heart"}
+    if scar_surfaces:
+        report["outputs"].update({"scar_labels": str(out / "scar_labels.nii.gz"), "scar_prim": "/World/Patient/Scar"})
     report["runtime_s"] = round(time.time() - t0, 1)
     (out / "imaging_report.json").write_text(json.dumps(report, indent=2, default=str))
     log(f"[imaging] {len(surfaces)} structures -> {usd_path} ({report['qc']['status']})")

@@ -82,16 +82,18 @@ def unload(model: MechanicsModel, edps_mmhg: Sequence[float], iters=8, tol_mm=No
            log: Callable = print) -> dict:
     """Recover the stress-free reference of an end-diastolic geometry (Sellier fixed point)."""
     X_img = model.mesh.points.copy()
-    tol = tol_mm if tol_mm is not None else 0.05 * model.mesh.spacing
+    tol = tol_mm if tol_mm is not None else 0.1 * model.mesh.spacing  # on the mean node residual
     X = X_img.copy()
     model.set_reference(X)
-    hist = []
+    v_img = [v / 1000.0 for v in model.V0s]
+    hist, hist_mean = [], []
     u_prev = None
     for it in range(iters):
         u, vols = inflate(model, edps_mmhg, steps, u0=None if u_prev is None else u_prev)
         res = np.linalg.norm(X + u - X_img, axis=1)
         hist.append(float(res.max()))
-        if res.max() < tol:
+        hist_mean.append(float(res.mean()))
+        if res.mean() < tol and abs(vols[0] - v_img[0]) / v_img[0] < 0.01:
             break
         step = 1.0
         while step > 0.1:
@@ -109,10 +111,14 @@ def unload(model: MechanicsModel, edps_mmhg: Sequence[float], iters=8, tol_mm=No
         u_prev = X_img - X
     else:
         u, vols = inflate(model, edps_mmhg, steps, u0=u_prev)
-        hist.append(float(np.linalg.norm(X + u - X_img, axis=1).max()))
-    return {"iterations": len(hist), "residual_mm": hist[-1], "residual_history_mm": hist,
-            "unloaded_volumes_ml": [v / 1000.0 for v in model.V0s], "loaded_volumes_ml": vols,
-            "converged": hist[-1] < tol}
+        res = np.linalg.norm(X + u - X_img, axis=1)
+        hist.append(float(res.max()))
+        hist_mean.append(float(res.mean()))
+    vol_err = abs(vols[0] - v_img[0]) / v_img[0]
+    return {"iterations": len(hist), "residual_mm": hist[-1], "mean_residual_mm": hist_mean[-1],
+            "residual_history_mm": hist, "unloaded_volumes_ml": [v / 1000.0 for v in model.V0s],
+            "image_volumes_ml": v_img, "loaded_volumes_ml": vols, "lv_volume_error_pct": 100 * vol_err,
+            "converged": hist_mean[-1] < tol and vol_err < 0.02}
 
 
 def _secant_log(f, s0, s1, tol=0.01, it=8, lo=0.05, hi=20.0, log=print):

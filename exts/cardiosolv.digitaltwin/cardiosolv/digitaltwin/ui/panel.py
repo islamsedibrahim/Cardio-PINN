@@ -144,6 +144,8 @@ class CardioSolvPanel:
                 self._combo("Modality", IMG_MODALITIES, ic.modality, lambda v: setattr(ic, "modality", v))
                 self._combo("Engine", IMG_ENGINES, ic.engine, lambda v: setattr(ic, "engine", v))
                 self._string_field("Cine MR phase (ed / es / index)", ic.phase, lambda v: setattr(ic, "phase", v or "ed"))
+                self._string_field("LGE MR (DICOM / NIfTI, optional)", "", lambda v: setattr(ic, "lge", v.strip() or None))
+                self._combo("LGE scar method", ["nsd", "fwhm"], ic.scar_method, lambda v: setattr(ic, "scar_method", v))
                 self._string_field("Local: imaging Python", ic.python, lambda v: setattr(ic, "python", v or "python"))
                 self._string_field("Local: imaging package dir", ic.package_dir,
                                    lambda v: setattr(ic, "package_dir", v or None))
@@ -173,7 +175,11 @@ class CardioSolvPanel:
             qc = rep.get("qc", {})
             vols = ", ".join(f"{k.replace('heart_', '')} {v['volume_ml']:.0f} mL"
                              for k, v in rep.get("structures", {}).items())
+            sc = rep.get("scar")
             self._labels["imaging_info"].text = (f"{rep.get('modality', '')}: {qc.get('status', '')}\n{vols}"
+                                                 + (f"\nLGE scar: core {sc['core_volume_ml']} mL, border zone "
+                                                    f"{sc['border_zone_volume_ml']} mL ({sc['scar_burden_pct']} % of LV)"
+                                                    if sc else "")
                                                  + "".join(f"\n! {w}" for w in qc.get("warnings", [])[:5]))
             self._set_status("imaging", "done", OK)
         except Exception as exc:
@@ -270,6 +276,12 @@ class CardioSolvPanel:
                 self._float_field("Fibre conduction velocity (mm/ms)", self.cfg.ep.cv_fiber, "ep.cv_fiber")
                 self._float_field("Cross-fibre CV (mm/ms)", self.cfg.ep.cv_cross, "ep.cv_cross")
                 ui.Button("Run Electrophysiology", height=26, clicked_fn=lambda: self._spawn(self._run_stage("ep")))
+                with ui.HStack(height=26, spacing=4):
+                    ui.Button("CRT lead study", clicked_fn=lambda: self._spawn(self._run_crt()))
+                    ui.Label("with FE beats", width=90)
+                    cb = ui.CheckBox(width=20)
+                    cb.model.add_value_changed_fn(lambda m: setattr(self, "_crt_fe", m.as_bool))
+                self._labels["crt_info"] = ui.Label("", word_wrap=True, height=0)
                 self._status_row("ep")
                 self._labels["ep_info"] = ui.Label("", word_wrap=True, height=0)
                 self._plots_frame["ep"] = ui.Frame(height=0)
@@ -282,10 +294,12 @@ class CardioSolvPanel:
                 self._float_field("Peripheral resistance (mmHg s/mL)", self.cfg.r_periph, "r_periph")
                 self._float_field("Arterial compliance (mL/mmHg)", self.cfg.c_art, "c_art")
                 ui.Label("Diastole / passive personalisation", height=18)
-                states = ["auto", "unloaded", "end_diastolic"]
+                states = ["unloaded", "end_diastolic", "auto"]
                 with ui.HStack(height=22):
                     ui.Label("Imaged geometry is", width=220)
-                    c = ui.ComboBox(0, *states)
+                    c = ui.ComboBox(states.index(self.cfg.geometry_state), *states,
+                                    tooltip="end_diastolic: your heart is an end-diastolic image at the LV / RV EDP "
+                                            "entered below; the unloaded heart and the passive stiffness are fitted")
                     c.model.add_item_changed_fn(lambda m, _: self._set_cfg("geometry_state", states[_combo_value(m)]))
                 calib = ["auto", "off", "klotz", "measured"]
                 with ui.HStack(height=22):
@@ -404,6 +418,7 @@ class CardioSolvPanel:
 
                 p.invalidate_after("discover")
                 p.scan = scan_heart(p.stage, p.source_path)  # USD read on main thread
+                p.extract_scar_surfaces()  # scar / border-zone meshes are not anatomy
                 p.prepare_scan()
                 await self._in_thread(p.compute_assignment)
                 p.done.append("discover")
@@ -475,6 +490,29 @@ class CardioSolvPanel:
             with edit_context(stage):
                 stage.RemovePrim("/CardioSolv")
         self._log("CardioSolv results removed from the stage (your mesh is untouched).")
+
+    async def _run_crt(self):
+        p = self.pipe
+        if p is None or "mesh" not in p.done:
+            self._log("Build the mesh (stage 3) first.")
+            return
+        self._busy = True
+        try:
+            r = await self._in_thread(p.run_crt_study, bool(getattr(self, "_crt_fe", False)))
+            b, resp = r["best_site"], r["response"]
+            txt = (f"LBBB LV activation {r['lbbb']['lv_activation_time_ms']:.0f} ms -> best LV lead "
+                   f"(x_l {b['x_l']:.2f}, x_c {b['x_c']:.2f}) {b['lv_activation_time_ms']:.0f} ms, QRS "
+                   f"{b['qrs_duration_ms']:.0f} ms\nPredicted response: {resp['predicted_response']}"
+                   + "".join(f"; {x}" for x in resp["reasons"]))
+            if "haemodynamics" in r:
+                h = r["haemodynamics"]
+                txt += f"\nFE: dP/dt max {h['dpdt_max_change_pct']:+.1f} %, EF {h['ef_change_points']:+.1f} points"
+            self._labels["crt_info"].text = txt
+        except Exception as exc:
+            carb.log_error(traceback.format_exc())
+            self._log(f"ERROR in CRT study: {exc}")
+        finally:
+            self._busy = False
 
     def _what_if(self, scale):
         p = self.pipe
@@ -549,6 +587,11 @@ class CardioSolvPanel:
         self._labels["ep_info"].text = (f"QRS {m['qrs_duration_ms']:.0f} ms | total activation "
                                         f"{m['total_activation_time_ms']:.0f} ms | septal->lateral "
                                         f"{m['septal_to_lateral_delay_ms']:.0f} ms | APD {m['mean_apd_ms']:.0f} ms"
+                                        + (f"\nScar: core {self.pipe.scar.metrics['core_volume_ml']:.1f} mL, BZ "
+                                           f"{self.pipe.scar.metrics['border_zone_volume_ml']:.1f} mL, LV burden "
+                                           f"{self.pipe.scar.metrics['lv_scar_burden_pct']:.0f} %, "
+                                           f"{self.pipe.scar.metrics['conduction_channels']} conduction channel(s)"
+                                           if self.pipe.scar is not None else "")
                                         + (f"\nRV activated by {m['rv_total_activation_ms']:.0f} ms | LV-RV free-wall "
                                            f"delay {m['interventricular_delay_ms']:.0f} ms"
                                            if "rv_total_activation_ms" in m else ""))

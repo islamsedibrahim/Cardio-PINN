@@ -37,11 +37,16 @@ class ImagingConfig:
     package_dir: Optional[str] = None  # path of the imaging/ folder if not pip-installed
     service_url: str = "http://localhost:8040"
     timeout_s: float = 3600.0
+    lge: Optional[str] = None  # LGE MR (DICOM folder or NIfTI) of the same examination -> scar meshes
+    scar_method: str = "nsd"  # nsd | fwhm
+    scar_sd: float = 3.0
 
 
 def run_local(input_path, out_dir, cfg: ImagingConfig, log: Callable = print) -> dict:
     cmd = [cfg.python, "-m", "cardiosolv_imaging.cli", str(input_path), "-o", str(out_dir), "--json",
            "--modality", cfg.modality, "--engine", cfg.engine, "--phase", cfg.phase, "--iso", str(cfg.iso_mm)]
+    if cfg.lge:
+        cmd += ["--lge", str(cfg.lge), "--scar-method", cfg.scar_method, "--scar-sd", str(cfg.scar_sd)]
     env = dict(os.environ)
     if cfg.package_dir:
         env["PYTHONPATH"] = os.pathsep.join([cfg.package_dir, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
@@ -56,15 +61,17 @@ def run_local(input_path, out_dir, cfg: ImagingConfig, log: Callable = print) ->
     return report
 
 
-def _multipart(fields: dict, file_field: str, filename: str, payload: bytes):
+def _multipart(fields: dict, file_field: str, filename: str, payload: bytes, extra_files=None):
     boundary = uuid.uuid4().hex
     out = io.BytesIO()
     for k, v in fields.items():
         out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
-    out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"\r\n"
-              f"Content-Type: application/octet-stream\r\n\r\n".encode())
-    out.write(payload)
-    out.write(f"\r\n--{boundary}--\r\n".encode())
+    for field_name, (fname, data) in [(file_field, (filename, payload))] + list((extra_files or {}).items()):
+        out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{fname}\"\r\n"
+                  f"Content-Type: application/octet-stream\r\n\r\n".encode())
+        out.write(data)
+        out.write(b"\r\n")
+    out.write(f"--{boundary}--\r\n".encode())
     return out.getvalue(), f"multipart/form-data; boundary={boundary}"
 
 
@@ -82,8 +89,13 @@ def _zip_input(input_path: Path):
 def run_service(input_path, out_dir, cfg: ImagingConfig, log: Callable = print, poll_s=2.0) -> dict:
     base = cfg.service_url.rstrip("/")
     name, payload = _zip_input(Path(input_path))
-    body, ctype = _multipart({"modality": cfg.modality, "engine": cfg.engine, "phase": cfg.phase,
-                              "iso_mm": cfg.iso_mm}, "file", name, payload)
+    fields = {"modality": cfg.modality, "engine": cfg.engine, "phase": cfg.phase, "iso_mm": cfg.iso_mm}
+    extra = {}
+    if cfg.lge:
+        lname, lpayload = _zip_input(Path(cfg.lge))
+        extra["lge"] = ("lge_" + lname, lpayload)
+        fields.update(scar_method=cfg.scar_method, scar_sd=cfg.scar_sd)
+    body, ctype = _multipart(fields, "file", name, payload, extra)
     log(f"[imaging] uploading {len(payload) / 1e6:.1f} MB to {base}")
     req = urllib.request.Request(f"{base}/segment", data=body, method="POST", headers={"Content-Type": ctype})
     with urllib.request.urlopen(req, timeout=300) as r:
@@ -109,6 +121,8 @@ def run_service(input_path, out_dir, cfg: ImagingConfig, log: Callable = print, 
     report = json.loads((out / "imaging_report.json").read_text())
     report["outputs"]["usd"] = str(out / "heart.usda")
     report["outputs"]["label_map"] = str(out / "heart_labels.nii.gz")
+    if (out / "scar_labels.nii.gz").exists():
+        report["outputs"]["scar_labels"] = str(out / "scar_labels.nii.gz")
     return report
 
 

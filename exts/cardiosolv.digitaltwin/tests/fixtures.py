@@ -144,3 +144,40 @@ def write_skin_only_heart_usd(path, scale=9.0):
     m.CreateFaceVertexIndicesAttr(f.reshape(-1).tolist())
     stage.GetRootLayer().Save()
     return path
+
+
+def synthetic_scar_masks(h=1.0, channel=True):
+    """Lateral mid-ventricular infarct of the synthetic LV (local mm, same grid as the heart):
+    dense core with a border-zone rim and, optionally, an 8 mm border-zone corridor through the core
+    along the long axis (a conduction channel)."""
+    masks, origin, h = synthetic_heart_masks(h)
+    ax = np.arange(-70, 100 + h, h)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij")
+    myo = masks["myo"]
+    block = (X > 10) & (np.abs(Y) < 16) & (Z > -42) & (Z < -6)
+    core = myo & block
+    if channel:
+        core &= ~(np.abs(Y) < 4)
+    from scipy.ndimage import binary_dilation
+
+    bz = myo & binary_dilation(myo & block, iterations=4) & ~core
+    return {"scar_core": core, "scar_border_zone": bz}, origin, h
+
+
+def add_synthetic_scar_usd(path, channel=True, meters_per_unit=0.01, rotate_xyz=(30.0, -20.0, 75.0),
+                           translate=(12.0, 105.0, -4.0)):
+    """Scar meshes as the imaging package writes them: /World/Patient/Scar/{scar_core, scar_border_zone}."""
+    masks, origin, h = synthetic_scar_masks(channel=channel)
+    stage = Usd.Stage.Open(path)
+    scar = UsdGeom.Xform.Define(stage, "/World/Patient/Scar")
+    scar.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    scar.AddRotateXYZOp().Set(Gf.Vec3f(*rotate_xyz))
+    unit = 0.001 / meters_per_unit
+    for name, mask in masks.items():
+        v, f = _surface(mask, origin, h, sigma=0.7)
+        m = UsdGeom.Mesh.Define(stage, f"/World/Patient/Scar/{name}")
+        m.CreatePointsAttr([Gf.Vec3f(*p) for p in (v * unit)])
+        m.CreateFaceVertexCountsAttr([3] * len(f))
+        m.CreateFaceVertexIndicesAttr(f.reshape(-1).tolist())
+    stage.GetRootLayer().Save()
+    return path, masks

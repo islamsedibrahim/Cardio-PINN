@@ -19,3 +19,19 @@ def synthetic_heart_masks(h=1.0):
     ao = ((X - 12) ** 2 + (Y - 14) ** 2 <= 11**2) & (Z >= 8) & (Z <= 90) & ~la
     origin = np.array([ax[0]] * 3)
     return {"myo": myo, "lv": lv, "rv": rv, "la": la, "ra": ra, "ao": ao}, origin, h
+
+
+def synthetic_scar_masks(h=1.0, channel=True):
+    """Lateral mid-ventricular infarct (copy of the extension fixture): core, border-zone rim, corridor."""
+    from scipy.ndimage import binary_dilation
+
+    masks, origin, h = synthetic_heart_masks(h)
+    ax = np.arange(-70, 100 + h, h)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij")
+    myo = masks["myo"]
+    block = (X > 10) & (np.abs(Y) < 16) & (Z > -42) & (Z < -6)
+    core = myo & block
+    if channel:
+        core &= ~(np.abs(Y) < 4)
+    bz = myo & binary_dilation(myo & block, iterations=4) & ~core
+    return {"scar_core": core, "scar_border_zone": bz}, origin, h

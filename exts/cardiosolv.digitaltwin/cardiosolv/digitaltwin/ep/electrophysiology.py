@@ -73,6 +73,7 @@ class EPConfig:
     duration: float = 450.0
     output_dt: float = 5.0
     custom_sites: List[tuple] = field(default_factory=list)  # [(x, y, z, delay_ms)] world mm
+    lv_lead: Optional[tuple] = None  # (x_l, x_c) of the LV epicardial lead in CRT (default 0.55, 0.50)
 
 
 @dataclass
@@ -121,11 +122,13 @@ def _site_nodes(mesh: TetMesh, coords: VentricularCoordinates, sets, set_name, x
     return nodes[d <= radius]
 
 
-def stimulus_sites(mesh, coords, cfg: EPConfig):
+def stimulus_sites(mesh, coords, cfg: EPConfig, scar=None):
     sets = mesh.node_sets()
     proto = PACING_PROTOCOLS[cfg.protocol]
     nodes, delays = [], []
     for set_name, xl, xc, delay in proto["sites"]:
+        if set_name == "epi" and cfg.protocol == "crt" and cfg.lv_lead is not None:
+            xl, xc = cfg.lv_lead
         sel = _site_nodes(mesh, coords, sets, set_name, xl, xc, cfg.site_radius_mm)
         nodes.append(sel)
         delays.append(np.full(len(sel), delay))
@@ -137,6 +140,11 @@ def stimulus_sites(mesh, coords, cfg: EPConfig):
             delays.append(np.full(len(sel), delay))
     nodes = np.concatenate(nodes)
     delays = np.concatenate(delays)
+    if scar is not None:  # no capture inside dense scar
+        keep = ~scar.node_core[nodes]
+        nodes, delays = nodes[keep], delays[keep]
+        if len(nodes) == 0:
+            raise RuntimeError("Every stimulus site lies in dense scar (no capture).")
     order = np.argsort(delays)
     uniq, first = np.unique(nodes[order], return_index=True)
     return uniq, delays[order][first], proto["purkinje"]
@@ -162,7 +170,8 @@ def _edges(tets):
     return np.unique(e, axis=0)
 
 
-def eikonal_activation(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, stim, delays, purkinje):
+def eikonal_activation(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, stim, delays, purkinje,
+                       scar=None):
     e = _edges(mesh.tets)
     d = mesh.points[e[:, 1]] - mesh.points[e[:, 0]]
     f = coords.fiber_nodes[e[:, 0]] + np.sign(np.einsum("ij,ij->i", coords.fiber_nodes[e[:, 0]],
@@ -172,9 +181,16 @@ def eikonal_activation(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPCon
     dt2 = np.maximum(np.einsum("ij,ij->i", d, d) - dl**2, 0)
     w = np.sqrt(dl**2 / cfg.cv_fiber**2 + dt2 / cfg.cv_cross**2)
     fn = purkinje_nodes(coords, cfg, purkinje)
+    if scar is not None:
+        fn &= ~scar.node_core & ~scar.node_bz  # no Purkinje inside scar
     if fn.any():
         fast = fn[e[:, 0]] & fn[e[:, 1]]
         w[fast] /= cfg.purkinje_speedup
+    if scar is not None:
+        slow = scar.node_bz[e[:, 0]] | scar.node_bz[e[:, 1]]
+        w[slow] /= scar.params.bz_cv_factor
+        block = scar.node_core[e[:, 0]] | scar.node_core[e[:, 1]]  # dense scar does not conduct
+        e, w = e[~block], w[~block]
     # Kuhn/structured graphs overestimate straight-line paths by ~6%
     w *= 0.94
     n = mesh.n_nodes
@@ -190,25 +206,31 @@ def apd_map(coords: VentricularCoordinates, cfg: EPConfig):
     return (cfg.apd_endo + (cfg.apd_epi - cfg.apd_endo) * coords.x_t + cfg.apd_apex_base * coords.x_l)
 
 
-def conductivity_tensors(coords: VentricularCoordinates, d_f, d_t, endo_factor=1.0, fast_nodes=None, tets=None):
+def conductivity_tensors(coords: VentricularCoordinates, d_f, d_t, endo_factor=1.0, fast_nodes=None, tets=None,
+                         scar=None):
     f = coords.fiber
     D = d_t * np.eye(3)[None] + (d_f - d_t) * np.einsum("ei,ej->eij", f, f)
     if endo_factor != 1.0 and tets is not None and fast_nodes is not None:
         endo = fast_nodes[tets].mean(1) >= 0.5
         D[endo] *= endo_factor
+    if scar is not None:
+        D[scar.tet_label == 1] *= scar.params.bz_cv_factor ** 2  # CV ~ sqrt(D)
+        D[scar.tet_label == 2] *= 1e-4  # dense scar ~ insulating
     return D
 
 
 def monodomain(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, stim, delays, purkinje,
-               log=None):
+               log=None, scar=None):
     """Mitchell-Schaeffer monodomain (normalised v in [0,1])."""
     # D from target CV: CV ~ sqrt(D / tau_in) * c for Mitchell-Schaeffer (c ~ 0.47 for v_gate 0.13)
     tau_in, tau_out, tau_open, tau_close, v_gate = 0.3, 6.0, 120.0, 150.0, 0.13
     c = 0.47
     d_f = (cfg.cv_fiber / c) ** 2 * tau_in
     d_t = (cfg.cv_cross / c) ** 2 * tau_in
-    D = conductivity_tensors(coords, d_f, d_t, cfg.purkinje_speedup**2, purkinje_nodes(coords, cfg, purkinje),
-                             mesh.tets)
+    fast = purkinje_nodes(coords, cfg, purkinje)
+    if scar is not None:
+        fast &= ~scar.node_core & ~scar.node_bz
+    D = conductivity_tensors(coords, d_f, d_t, cfg.purkinje_speedup**2, fast, mesh.tets, scar)
     K = stiffness_matrix(mesh.points, mesh.tets, D)
     m = lumped_mass(mesh.points, mesh.tets)
     dt = cfg.dt
@@ -217,6 +239,7 @@ def monodomain(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, sti
     A = (sp.diags(m / dt) + 0.5 * K).tocsc()
     solver = splu(A)
     n = mesh.n_nodes
+    excitable = np.ones(n) if scar is None else (~scar.node_core).astype(float)
     v = np.zeros(n)
     h = np.ones(n)
     act = np.full(n, np.inf)
@@ -229,7 +252,7 @@ def monodomain(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, sti
         stim_on = (t >= delays) & (t < delays + 2.0)
         jst = np.zeros(n)
         jst[stim[stim_on]] = 0.5
-        jin = h * v * v * (1 - v) / tau_in
+        jin = h * v * v * (1 - v) / tau_in * excitable
         jout = -v / tau_out
         v_star = v + dt * (jin + jout + jst)
         h = np.where(v < v_gate, h + dt * (1 - h) / tau_open, h - dt * h / tau_close)
@@ -274,42 +297,55 @@ def pseudo_ecg(mesh: TetMesh, coords: VentricularCoordinates, result: EPResult, 
 
 
 def run_electrophysiology(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, long_axis=None,
-                          septum_direction=None, log=print) -> EPResult:
+                          septum_direction=None, log=print, scar=None) -> EPResult:
+    """``scar``: optional ``core.scar.ScarModel`` (unexcitable core, slow border zone)."""
     if cfg.protocol not in PACING_PROTOCOLS:
         raise ValueError(f"Unknown pacing protocol {cfg.protocol}; choose from {list(PACING_PROTOCOLS)}")
-    stim, delays, purkinje = stimulus_sites(mesh, coords, cfg)
+    if scar is not None and not scar.any:
+        scar = None
+    stim, delays, purkinje = stimulus_sites(mesh, coords, cfg, scar)
     apd = apd_map(coords, cfg)
+    if scar is not None:
+        apd = np.where(scar.node_bz, apd * scar.params.bz_apd_factor, apd)
     frames = times = None
     if cfg.solver == "eikonal":
-        act = eikonal_activation(mesh, coords, cfg, stim, delays, purkinje)
+        act = eikonal_activation(mesh, coords, cfg, stim, delays, purkinje, scar)
         rep = act + apd
     elif cfg.solver == "monodomain":
-        act, rep, frames, times = monodomain(mesh, coords, cfg, stim, delays, purkinje, log)
+        act, rep, frames, times = monodomain(mesh, coords, cfg, stim, delays, purkinje, log, scar)
         fill = ~np.isfinite(rep) & np.isfinite(act)
         rep[fill] = act[fill] + apd[fill]
     else:
         raise ValueError(f"Unknown EP solver {cfg.solver}")
     finite = np.isfinite(act)
+    unexcitable = scar.node_core if scar is not None else np.zeros(len(act), bool)
+    if (~finite & ~unexcitable).any():
+        log(f"EP warning: {(~finite & ~unexcitable).sum()} excitable nodes never activated")
     if not finite.all():
-        log(f"EP warning: {(~finite).sum()} nodes never activated")
         act[~finite] = np.nanmax(act[finite]) if finite.any() else 0.0
         rep[~np.isfinite(rep)] = act[~np.isfinite(rep)] + apd[~np.isfinite(rep)]
     lv = np.ones(len(act), bool) if coords.node_region is None else coords.node_region == 0
+    exc = ~unexcitable  # activation statistics over excitable tissue
+    lv = lv & exc
+    a = act[exc]
     lateral = lv & (np.abs(coords.x_c - 0.5) < 0.12) & (coords.x_l > 0.3) & (coords.x_l < 0.8)
     septal = lv & (np.minimum(coords.x_c, 1 - coords.x_c) < 0.08) & (coords.x_l > 0.3) & (coords.x_l < 0.8)
     metrics = {
-        "total_activation_time_ms": float(act.max() - act.min()),
-        "qrs_duration_ms": float(np.percentile(act, 98) - act.min()),
-        "mean_activation_ms": float(act.mean()),
+        "total_activation_time_ms": float(a.max() - a.min()),
+        "qrs_duration_ms": float(np.percentile(a, 98) - a.min()),
+        "mean_activation_ms": float(a.mean()),
         "septal_to_lateral_delay_ms": float(act[lateral].mean() - act[septal].mean()) if lateral.any() and septal.any() else 0.0,
-        "mean_apd_ms": float((rep - act).mean()),
+        "mean_apd_ms": float((rep - act)[exc].mean()),
         "stimulus_nodes": int(len(stim)),
+        "lv_activation_time_ms": float(act[lv].max() - a.min()),
     }
+    if scar is not None:
+        metrics["unexcitable_nodes"] = int(unexcitable.sum())
     if coords.node_region is not None and (coords.node_region == 1).any():
-        rv = coords.node_region == 1
+        rv = (coords.node_region == 1) & exc
         metrics.update({
-            "lv_total_activation_ms": float(act[lv].max() - act.min()),
-            "rv_total_activation_ms": float(act[rv].max() - act.min()),
+            "lv_total_activation_ms": float(act[lv].max() - a.min()),
+            "rv_total_activation_ms": float(act[rv].max() - a.min()),
             # mean LV free-wall minus mean RV free-wall activation: >0 = LV late (LBBB), <0 = RV late (RBBB)
             "interventricular_delay_ms": float(act[lateral].mean() - act[rv].mean()) if lateral.any() else 0.0,
         })

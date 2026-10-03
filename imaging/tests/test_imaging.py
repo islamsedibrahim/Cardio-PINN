@@ -169,3 +169,37 @@ def test_rest_service_roundtrip(ct_dir, gt_path, tmp_path, monkeypatch):
     assert usd.status_code == 200 and b"heart_myocardium" in usd.content
     assert client.get(f"/jobs/{job}/../../etc/passwd").status_code == 404
     assert client.delete(f"/jobs/{job}").json()["deleted"]
+
+
+def test_lge_scar_to_usd(ct_dir, gt_path, tmp_path, monkeypatch):
+    """CT anatomy + LGE MR of the same patient -> scar core / border zone meshes next to the heart."""
+    from pxr import Usd, UsdGeom
+
+    from _heart_phantom import synthetic_scar_masks
+    from synthetic_dicom import write_lge_study
+
+    root = tmp_path / "bundle"
+    monkeypatch.setenv("NV_SEGMENT_CTMR_ROOT", str(root))
+    monkeypatch.setenv("NV_SEGMENT_CTMR_PYTHON", make_fake_bundle(root, gt_path))
+    write_lge_study(str(tmp_path / "lge"))
+    rep = run(ct_dir / "dicom", tmp_path / "out", engine="nv-segment", lge=str(tmp_path / "lge"), log=lambda *a: None)
+    sc = rep["scar"]
+    gt, _, _ = synthetic_scar_masks()
+    gt_core, gt_scar = gt["scar_core"].sum() / 1000, (gt["scar_core"] | gt["scar_border_zone"]).sum() / 1000
+    total = sc["core_volume_ml"] + sc["border_zone_volume_ml"]
+    assert abs(total - gt_scar) / gt_scar < 0.35  # 8 mm LGE slices
+    assert abs(sc["core_volume_ml"] - gt_core) / gt_core < 0.45
+    assert sc["removed_components"]["endocardial_rim"] >= 0 and 8 < sc["scar_burden_pct"] < 30
+    stage = Usd.Stage.Open(rep["outputs"]["usd"])
+    assert UsdGeom.Mesh(stage.GetPrimAtPath("/World/Patient/Scar/scar_core"))
+    assert UsdGeom.Mesh(stage.GetPrimAtPath("/World/Patient/Scar/scar_border_zone"))
+    try:
+        from cardiosolv.digitaltwin.pipeline import CardioSolvPipeline, PipelineConfig
+    except ImportError:
+        return
+    pipe = CardioSolvPipeline(stage, "/World/Patient/Heart", PipelineConfig(element_size_mm=4.0), log=lambda *a: None)
+    for name in ("discover", "geometry", "mesh"):
+        getattr(pipe, f"run_{name}")()
+    assert "scar_core" not in {pipe.scan.parts[i].name for i in pipe.assignment.roles.values()}
+    m = pipe.scar.metrics
+    assert m["core_volume_ml"] > 3 and m["lateral_scar_pct"] > 15 and m["septal_scar_pct"] < 2

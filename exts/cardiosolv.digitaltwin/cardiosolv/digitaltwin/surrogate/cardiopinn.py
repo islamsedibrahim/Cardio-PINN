@@ -96,6 +96,11 @@ class CardioPINNSurrogate:
         # stress-free reference (they differ by model.offset after passive unloading)
         self.offset = torch.as_tensor(model.offset, dtype=model.dtype, device=model.device)
         self.K = model.n_cavities
+        # activation level tau(t): mean active tension at unit contractility / T_max. The network sees
+        # s * tau(t) instead of s, so relaxed states (tau = 0) cannot depend on contractility
+        self._tau_t = np.linspace(0.0, self.cfg.t_max_ms, 401)
+        tm = max(model.cfg.t_max_kpa * 1e3, 1e-9)
+        self._tau = np.array([model.active_tension(float(t), 1.0).mean() / tm for t in self._tau_t])
         self.p_max = [self.cfg.p_max_mmhg, self.cfg.p_max_rv_mmhg][: self.K]
         self.net, self.backbone = _build_net(self.cfg, r, n_in=self.K + 2)
         self.net = self.net.to(model.device).double()
@@ -111,7 +116,9 @@ class CardioPINNSurrogate:
         """Network input from pressures (B,K) mmHg, times (B,) ms and contractility scales (B,)."""
         ps = np.atleast_2d(np.asarray(ps, float))
         cols = [ps[:, k] / self.p_max[k] for k in range(self.K)]
-        cols += [np.asarray(t_ms, float).reshape(-1) / self.cfg.t_max_ms, np.asarray(s, float).reshape(-1)]
+        t = np.clip(np.asarray(t_ms, float).reshape(-1), 0.0, self.cfg.t_max_ms)
+        act = np.asarray(s, float).reshape(-1) * np.interp(t, self._tau_t, self._tau)
+        cols += [t / self.cfg.t_max_ms, act]
         return torch.as_tensor(np.stack(np.broadcast_arrays(*cols), 1), dtype=self.model.dtype,
                                device=self.model.device)
 

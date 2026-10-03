@@ -143,6 +143,44 @@ def write_cine_mr_study(folder, phases=3, slice_mm=8.0, inplane=1.5):
     return folder, lab, aff
 
 
+def write_lge_study(folder, slice_mm=8.0, inplane=1.5, noise_sd=10.0, seed=0):
+    """Short-axis LGE (inversion recovery): nulled healthy myocardium 50, border zone 130, dense scar 330,
+    blood 250, background 20, Gaussian noise; same geometry as the cine study."""
+    import pydicom.uid as U
+
+    from _heart_phantom import synthetic_scar_masks
+
+    lab, aff, masks = gt_label_volume()
+    scar, _, _ = synthetic_scar_masks()
+    os.makedirs(folder, exist_ok=True)
+    study, series = U.generate_uid(), U.generate_uid()
+    t = np.deg2rad(20)
+    n_ax = np.array([0, np.sin(t), np.cos(t)])
+    row_dir = np.array([1.0, 0, 0])
+    col_dir = np.cross(n_ax, row_dir)
+    rows = cols = 96
+    sig = np.full(lab.shape, 20.0, np.float32)
+    sig[lab == 154] = 50
+    for v in (151, 152, 149, 153, 6):
+        sig[lab == v] = 250
+    sig[scar["scar_border_zone"]] = 130
+    sig[scar["scar_core"]] = 330
+    rng = np.random.default_rng(seed)
+    for k in range(int(80 / slice_mm) + 1):
+        centre_ras = np.array([0.0, 0.0, -50.0]) + n_ax * (k * slice_mm)
+        ii, jj = np.meshgrid(np.arange(cols), np.arange(rows))
+        off = (ii - cols / 2)[..., None] * row_dir * inplane + (jj - rows / 2)[..., None] * col_dir * inplane
+        vals = _sample(sig, aff, (centre_ras + off).reshape(-1, 3), order=1).reshape(rows, cols)
+        px = np.round(np.clip(vals + rng.normal(0, noise_sd, vals.shape), 0, None)).astype(np.int16)
+        first_ras = centre_ras - (cols / 2) * row_dir * inplane - (rows / 2) * col_dir * inplane
+        to_lps = np.array([-1, -1, 1.0])
+        ds = _ds("MR", series, study, k, rows, cols, list(row_dir * to_lps) + list(col_dir * to_lps),
+                 list(first_ras * to_lps), (inplane, inplane), slice_mm, px, series_desc="LGE PSIR SA",
+                 image_type=("ORIGINAL", "PRIMARY", "M"))
+        ds.save_as(os.path.join(folder, f"lge_{k:03d}.dcm"), enforce_file_format=True)
+    return folder, scar
+
+
 FAKE_BUNDLE_PY = r'''
 import ast, sys, os
 import numpy as np, nibabel as nib

@@ -141,6 +141,57 @@ By default (`biventricular = True`) the twin simulates both ventricles:
 
 Set `biventricular = False` (panel: *Biventricular*) for the LV-only twin of earlier versions.
 
+## Scar, arrhythmia substrate and CRT
+
+**Scar input.** Closed meshes named like the imaging package's LGE output are recognised and kept out
+of anatomy discovery: `scar_core` / `myocardial_scar` / `infarct` (dense scar) and
+`scar_border_zone` / `grey_zone` (border zone). They can sit under the heart or next to it
+(`/World/Patient/Scar/...`). Any closed mesh works, so you can draw a scar in Omniverse.
+Stage 0 with an LGE series produces them automatically.
+
+Every tet is labelled healthy / border zone / core:
+
+| | EP | Mechanics |
+|---|---|---|
+| Dense core | unexcitable, blocks conduction, no capture of a lead placed in it | no active tension, passive stiffness ×5 |
+| Border zone | CV ×0.4, APD ×1.15, no Purkinje | active tension ×0.5, stiffness ×2 |
+
+**Substrate metrics.** Core and border-zone volume, LV scar burden, transmurality, distribution
+(basal / mid / apical, septal / lateral), and **conduction channels**: border-zone corridors through
+the core that open into healthy tissue at two places and are a real shortcut (removing them makes the
+path between the openings ≥ 1.5× and ≥ 10 mm longer). Each channel reports its length, the
+activation transit time and apparent conduction velocity: the isthmus candidates of scar-related VT.
+Paint the `scar` field to see core (white) and border zone (amber) on your mesh.
+
+**CRT lead study** (*CRT lead study* button, or `pipeline.run_crt_study(fe_beat=False)`). Starting from
+LBBB, it sweeps 36 LV epicardial lead sites with the RV septal lead (≈ 5 s, eikonal). Sites over dense
+scar do not capture, and sites over scar are avoided when another exists. It reports the best site,
+LV activation time and QRS shortening, and a predicted response with reasons: scar burden > 33 %,
+lead over scar, transmural lateral scar. With *FE beats* it also simulates LBBB vs best-site CRT and
+reports the change in LV dP/dt max (≥ 10 % = acute responder), EF and stroke work.
+
+## Passive personalisation (end-diastolic images)
+
+Hearts reconstructed by Stage 0 are usually end-diastolic images (CT, cine ED phase), so they are
+already inflated. You declare it: set *Imaged geometry is* = `end_diastolic` (`geometry_state`) and
+enter the patient's LV and RV end-diastolic pressures (and, if measured, the LVEDV). The extension then:
+
+1. recovers the **unloaded reference** with the backward-displacement fixed point of Sellier (2011):
+   inflating the reference to LV/RV EDP reproduces your image;
+2. fits the **passive stiffness** so the unloaded LV volume matches Klotz' prediction
+   `V0 = EDV (0.6 − 0.006 EDP)`, i.e. the imaged EDV lies on the Klotz EDPVR;
+3. reports the model EDPVR next to the Klotz curve, V0, V30 and the end-diastolic chamber stiffness.
+
+`geometry_state = auto` infers `end_diastolic` for hearts loaded by Stage 0. The default is
+`unloaded`, which simulates the mesh as stress-free, as in earlier versions. With an unloaded geometry
+(artist assets) and a measured LVEDV at EDP (`measured_edv_ml`) the
+stiffness is fitted to that point instead (`passive_calibration = measured`). The heartbeat then
+starts from the unloaded heart. Displacements stay relative to your imaged mesh, so the twin is
+painted and animated on your model and passes through it at end-diastole.
+
+On the synthetic heart (taken as an ED image at 10 mmHg) the model EDPVR matches Klotz to
+0.6 mL RMS from 0 to 30 mmHg; the unloaded LV is 28.9 mL vs Klotz' 28.9 mL.
+
 ## Physics
 
 | Stage | Model | Notes |
@@ -152,8 +203,11 @@ Set `biventricular = False` (panel: *Biventricular*) for the LV-only twin of ear
 | Circulation | 3-element Windkessel, implicit; isovolumetric phases by augmented Lagrangian | one energy minimisation per step |
 | Surrogate | Cardio-PINN parametric PINN: `(p, t, s) → POD amplitudes`, energy loss + FE anchors | PhysicsNeMo `FullyConnected` when available |
 
-On the bundled synthetic heart: EDV 79 mL, ESV 30 mL, **EF 62 %**, LV peak 131 mmHg,
-aortic 131/68 mmHg, peak fibre strain −15 %, myocardial volume preserved to 0.04 %.
+On the bundled synthetic heart (biventricular, 4 mm elements): LV EDV 78 mL, ESV 30 mL, **EF 62 %**,
+LV peak 131 mmHg, aortic 131/68 mmHg; RV EDV 94 mL, ESV 43 mL, **RVEF 55 %**, RV peak 28 mmHg,
+PA 28/6 mmHg; LV/RV stroke volume 49/51 mL; myocardial volume preserved to 0.04 %. The surrogate
+gives EF 64 % and RVEF 55 %. Its EDV is the same at every contractility, because the network sees
+the activation level s·τ(t), not s. EF is 34 / 64 / 68 % at 0.6 / 1.0 / 1.4 × contractility.
 
 **Transverse active stress.** Cardio-PINN adds `0.3·((I4s−1)+(I4n−1))` to the active energy.
 With isochoric invariants this term behaves like an isotropic active stiffening that opposes wall
@@ -191,8 +245,13 @@ python -m pytest
 * P1 tetrahedra with a penalty volumetric term; refine elements for stress quantities.
 * Monodomain conduction velocity needs ≤ 1 mm elements to converge; the eikonal solver is the
   interactive default.
-* The surrogate matches FE ejection fraction (63.5 vs 61.7 %; 33.6 vs 33.5 % at 0.6× contractility,
-  mean volume error 0.9 mL) but can show pressure overshoots in early ejection; use the FE beat for
-  pressure waveforms. EF above ~65 % may be out of the calibratable range (reported as such).
+* The surrogate matches FE ejection fraction within ~2 points but can show pressure overshoots in early
+  ejection; use the FE beat for pressure waveforms.
+* Scar from LGE is not registered to the anatomy (same examination assumed); thick LGE slices
+  underestimate small cores. Channel detection needs elements ≤ 3 mm. Scar EP/mechanics factors are
+  literature values, not patient-calibrated. VT inducibility (programmed stimulation with a
+  monodomain model) is not simulated; channels are candidate isthmuses.
+* Passive calibration fits one stiffness scale (fibre architecture and anisotropy ratios fixed) and
+  takes ~5 min on CPU at 4 mm elements. EF above ~65 % may be out of the calibratable range (reported as such).
 * If your heart asset is already animated (skinning/blend shapes), the twin's time samples override
   its points while the twin layer is active.

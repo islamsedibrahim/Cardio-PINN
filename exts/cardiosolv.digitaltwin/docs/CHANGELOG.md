@@ -11,6 +11,13 @@
   (model vs Klotz EDPVR, V0, V30, end-diastolic chamber stiffness). Displacements stay relative to the
   imaged mesh, so the twin is still painted and animated on your model.
 - Valves cannot close on the step they open (spurious backflow at opening).
+- Scar substrate: scar / border-zone meshes (from LGE or drawn) label the mesh; unexcitable core,
+  slow border zone with longer APD, no capture in scar; non-contracting stiff core; scar burden,
+  transmurality, functional conduction-channel (isthmus) detection with transit times; `scar` field.
+- CRT lead study: 36-site LV lead sweep from LBBB avoiding scar, LVAT/QRS shortening, predicted
+  response with reasons, optional FE LBBB vs CRT beats (ΔdP/dt max, ΔEF, Δstroke work); dP/dt max metric.
+- Surrogate input is the activation level s·τ(t), so relaxed states cannot depend on contractility
+  (fixes EDV changing with contractility in what-if runs).
 
 ## 0.5.0
 - Stage 0 imaging: DICOM CT / MR -> cardiovascular segmentation (NV-Segment-CTMR, TotalSegmentator

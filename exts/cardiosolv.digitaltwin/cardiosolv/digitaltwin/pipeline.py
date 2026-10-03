@@ -41,6 +41,7 @@ STAGE_TITLES = {
     "mechanics": "5  Biomechanics + circulation",
     "surrogate": "6  Cardio-PINN surrogate",
     "twin": "7  Digital twin on your mesh",
+    "crt": "CRT lead study",
 }
 
 
@@ -58,6 +59,10 @@ class PipelineConfig:
     biventricular: bool = True  # simulate the RV free wall + RV cavity with a pulmonary circulation
     rv_wall_mm: float = 3.5  # RV free wall thickness when it has to be derived from the RV blood pool
     geometry_spacing_mm: Optional[float] = None  # auto
+    scar: str = "auto"  # "auto": use scar / border-zone meshes found next to the heart | "off"
+    scar_bz_cv_factor: float = 0.4
+    scar_bz_contractility: float = 0.5
+    scar_core_stiffness: float = 5.0
     derived_wall_thickness_mm: float = 10.0
     element_size_mm: float = 3.0
     mesher: str = "voxel"  # "voxel" | "gmsh"
@@ -74,7 +79,9 @@ class PipelineConfig:
     p_aortic_diastolic: float = 80.0
     rv_edp_mmhg: float = 5.0
     # passive personalisation: the imaged geometry state and how stiffness is fitted
-    geometry_state: str = "auto"  # "auto" | "unloaded" | "end_diastolic" (auto: Stage 0 imaging -> end_diastolic)
+    # set by the user: "end_diastolic" when the heart is an end-diastolic image (with edp_mmhg / rv_edp_mmhg
+    # and optionally measured_edv_ml); "auto" infers it from Stage 0 provenance
+    geometry_state: str = "unloaded"  # "unloaded" | "end_diastolic" | "auto"
     passive_calibration: str = "auto"  # "auto" | "off" | "klotz" | "measured"
     measured_edv_ml: Optional[float] = None  # e.g. echo / MR LVEDV at edp_mmhg
     pvr: float = 0.14  # mmHg s / mL, pulmonary resistance of the RV Windkessel
@@ -108,6 +115,9 @@ class CardioSolvPipeline:
         self.surrogate = self.surrogate_cycle = None
         self.calibration = None
         self.passive = None
+        self.scar = None
+        self.scar_surfaces, self.scar_paths = {}, []
+        self.crt = None
         self.writer = None
         self.skin_part = None
         self.report: dict = {}
@@ -158,6 +168,7 @@ class CardioSolvPipeline:
 
         def go():
             self.scan = scan_heart(self.stage, self.source_path)
+            self.extract_scar_surfaces()
             self.log(f"[CardioSolv] {len(self.scan.parts)} mesh parts under {self.source_path} "
                      f"(metersPerUnit={self.scan.meters_per_unit})")
             self.prepare_scan()
@@ -166,6 +177,75 @@ class CardioSolvPipeline:
 
         self.invalidate_after("discover")
         return self._timed("discover", go)
+
+    def extract_scar_surfaces(self):
+        """Scar / border-zone meshes (LGE reconstruction or drawn by the user) are not anatomy:
+        take them out of the scan and keep them (world mm) for the scar substrate."""
+        from pxr import Usd, UsdGeom
+
+        from .core.scar import classify_scar_name
+        from .usd.scene_scanner import read_mesh
+
+        self.scar_surfaces, self.scar_paths = {}, []
+        if self.cfg.scar == "off":
+            return
+        keep_p, keep_s = [], []
+        for part, src in zip(self.scan.parts, self.scan.sources):
+            code = classify_scar_name(src.prim_path.rsplit("/", 1)[-1])
+            if code is None:
+                keep_p.append(part)
+                keep_s.append(src)
+            else:
+                self.scar_surfaces.setdefault(code, []).append(part)
+                self.scar_paths.append(src.prim_path)
+        self.scan.parts, self.scan.sources = keep_p, keep_s
+        if not self.scan.parts:
+            raise RuntimeError("Only scar meshes were found under the selected prim; select the heart.")
+        # siblings of the heart, e.g. /World/Patient/Scar/scar_core from the imaging package
+        root = self.stage.GetPrimAtPath(self.source_path)
+        parent = root.GetParent()
+        if parent and parent.IsValid() and str(parent.GetPath()) != "/":
+            cache = UsdGeom.XformCache(Usd.TimeCode(self.scan.time_code))
+            for prim in Usd.PrimRange(parent):
+                path = str(prim.GetPath())
+                if path == self.source_path or path.startswith(self.source_path + "/") or not prim.IsA(UsdGeom.Mesh):
+                    continue
+                names = [prim.GetName()] + [q.GetName() for q in (prim.GetParent(),) if q]
+                code = next((c for c in (classify_scar_name(n) for n in names) if c is not None), None)
+                if code is None:
+                    continue
+                try:
+                    surf, _, _ = read_mesh(prim, Usd.TimeCode(self.scan.time_code), cache, self.scan.mm_per_unit)
+                except Exception as exc:
+                    self.log(f"    scar mesh {path} skipped ({exc})")
+                    continue
+                self.scar_surfaces.setdefault(code, []).append(surf)
+                self.scar_paths.append(path)
+        if self.scar_paths:
+            self.log(f"    scar meshes: {', '.join(self.scar_paths)}")
+
+    def build_scar(self):
+        """Label the computational mesh with the scar meshes (after Stage 3)."""
+        from .core.scar import ScarParams, build_scar_model, label_tets
+
+        self.scar = None
+        if not getattr(self, "scar_surfaces", None):
+            return None
+        sim = {}
+        for code, surfs in self.scar_surfaces.items():
+            out = []
+            for srf in surfs:
+                q = srf.copy()
+                q.points = self.scan.to_sim(q.points)
+                out.append(q)
+            sim[code] = out
+        prm = ScarParams(bz_cv_factor=self.cfg.scar_bz_cv_factor, bz_contractility=self.cfg.scar_bz_contractility,
+                         core_stiffness=self.cfg.scar_core_stiffness)
+        self.scar = build_scar_model(self.mesh, self.coords, label_tets(self.mesh, sim), prm, self.scar_paths)
+        m = self.scar.metrics
+        self.log(f"    scar: core {m['core_volume_ml']:.1f} mL, border zone {m['border_zone_volume_ml']:.1f} mL, "
+                 f"LV burden {m['lv_scar_burden_pct']:.1f} %, {m['conduction_channels']} conduction channel(s)")
+        return self.scar
 
     def prepare_scan(self):
         if self.cfg.auto_scale:
@@ -295,6 +375,7 @@ class CardioSolvPipeline:
             self.mesh = build_tet_mesh(gl, myo_surface, self.cfg.element_size_mm, self.cfg.mesher, skin_surface=skin)
             self.coords = compute_coordinates(self.mesh, gl, self.cfg.endo_helix_deg, self.cfg.epi_helix_deg,
                                               self.cfg.sheet_gamma_deg)
+            self.build_scar()
             md = self.mesh.metadata
             self.log(f"    {md['nodes']} nodes, {md['tets']} tets, {md['volume_ml']:.1f} mL, "
                      f"surface snap {md.get('snap_mean_distance_mm', 0):.2f} mm")
@@ -310,7 +391,11 @@ class CardioSolvPipeline:
 
         def go():
             self.ep = run_electrophysiology(self.mesh, self.coords, self.cfg.ep, self.geometry.long_axis,
-                                            self.geometry.septum_direction, log=self.log)
+                                            self.geometry.septum_direction, log=self.log, scar=self.scar)
+            if self.scar is not None and self.scar.channels:
+                from .core.scar import channel_report
+
+                self.scar.metrics["channels"] = channel_report(self.scar.channels, self.ep.activation_time)
             m = self.ep.metrics
             self.log(f"    {self.cfg.ep.protocol}: QRS {m['qrs_duration_ms']:.0f} ms, total activation "
                      f"{m['total_activation_time_ms']:.0f} ms, septal->lateral delay {m['septal_to_lateral_delay_ms']:.0f} ms")
@@ -329,6 +414,31 @@ class CardioSolvPipeline:
                                  dt_ms=self.cfg.mechanics_dt_ms, rv_edp=self.cfg.rv_edp_mmhg,
                                  rv_r_periph=self.cfg.pvr, rv_c_art=self.cfg.c_pulmonary,
                                  p_pulmonary_diastolic=self.cfg.p_pulmonary_diastolic)
+
+    def run_crt_study(self, fe_beat=False):
+        """LV lead sweep for CRT in LBBB (eikonal), optionally with FE beats (LBBB vs best CRT)."""
+        self._require("mesh")
+        from .ep.crt import crt_study
+
+        fe = None
+        if fe_beat:
+            from .mechanics import MechanicsConfig, MechanicsModel, simulate_cycle
+
+            def fe(ep_res):
+                model = MechanicsModel(self.mesh, self.coords, self.geometry.long_axis,
+                                       MechanicsConfig(t_max_kpa=self.cfg.t_max_kpa, device=self.device),
+                                       ep_res.activation_time, ep_res.apd, scar=self.scar)
+                if self.mech_model is not None and self.passive:
+                    model.cfg.material.stiff_scale = self.mech_model.cfg.material.stiff_scale
+                    model.set_reference(self.mech_model.X.cpu().numpy())
+                return simulate_cycle(model, self._circulation(), log=lambda *a: None).metrics
+
+        def go():
+            self.crt = crt_study(self.mesh, self.coords, self.cfg.ep, self.scar, self.geometry.long_axis,
+                                 fe_beat=fe, log=self.log)
+            return self.crt
+
+        return self._timed("crt", go)
 
     def resolved_geometry_state(self) -> str:
         if self.cfg.geometry_state != "auto":
@@ -368,7 +478,7 @@ class CardioSolvPipeline:
         def go():
             mcfg = MechanicsConfig(t_max_kpa=self.cfg.t_max_kpa, device=self.device)
             self.mech_model = MechanicsModel(self.mesh, self.coords, self.geometry.long_axis, mcfg,
-                                             self.ep.activation_time, self.ep.apd)
+                                             self.ep.activation_time, self.ep.apd, scar=self.scar)
             self.run_passive_calibration()
             self.cycle = simulate_cycle(self.mech_model, self._circulation(), log=self.log,
                                         progress=lambda f: self.progress("mechanics", f))
@@ -429,6 +539,8 @@ class CardioSolvPipeline:
             return self.ep.activation_time
         if name == "transmural":
             return self.coords.x_t
+        if name == "scar":
+            return (self.scar.node_label() if self.scar is not None else np.zeros(self.mesh.n_nodes)).astype(float)
         if name == "transmembrane_potential":
             if cyc is None:
                 times = np.arange(0, 500, 10.0)
@@ -540,6 +652,11 @@ class CardioSolvPipeline:
                 rep["hemodynamics"][f"{name.lower()}_pv_loop"] = {
                     "t_ms": c.times, "pressure_mmhg": tr["pressure_mmhg"], "volume_ml": tr["volume_ml"],
                     "pulmonary_mmhg" if name == "RV" else "arterial_mmhg": tr["arterial_mmhg"], "phase": tr["phase"]}
+        if self.scar is not None:
+            rep["scar"] = {"sources": self.scar.sources, "params": self.scar.params.__dict__,
+                           "metrics": self.scar.metrics}
+        if self.crt is not None:
+            rep["crt_study"] = self.crt
         if getattr(self, "passive", None):
             rep["diastolic_calibration"] = self.passive
         if self.surrogate_cycle is not None:

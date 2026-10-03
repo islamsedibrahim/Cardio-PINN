@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cardiosolv-imaging"
-version = "0.1.0"
+version = "0.2.0"
 description = "CardioSolv Stage 0: CT/MR DICOM -> cardiovascular segmentation (NV-Segment-CTMR, TotalSegmentator) -> 3D heart USD"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}

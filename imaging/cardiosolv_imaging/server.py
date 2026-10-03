@@ -2,7 +2,8 @@
 
     uvicorn cardiosolv_imaging.server:app --host 0.0.0.0 --port 8040
 
-POST /segment          multipart: file=<zip of a DICOM folder | .nii/.nii.gz>, modality, engine, phase
+POST /segment          multipart: file=<zip of a DICOM folder | .nii/.nii.gz>, modality, engine, phase,
+                       optional lge=<zip | NIfTI of the LGE MR> + scar_method, scar_sd
 GET  /jobs/{id}        status + QC report
 GET  /jobs/{id}/heart.usda | heart_labels.nii.gz | imaging_report.json | bundle.zip
 GET  /health           engines available on this host
@@ -20,6 +21,7 @@ import threading
 import uuid
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -29,7 +31,7 @@ from .pipeline import run
 
 WORKDIR = Path(os.environ.get("CARDIOSOLV_IMAGING_WORKDIR", tempfile.gettempdir())) / "cardiosolv_jobs"
 WORKDIR.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="CardioSolv imaging", version="0.1.0")
+app = FastAPI(title="CardioSolv imaging", version="0.2.0")
 JOBS: dict = {}
 _LOCK = threading.Lock()  # one GPU job at a time
 
@@ -60,22 +62,29 @@ def health():
 
 @app.post("/segment")
 async def segment(file: UploadFile = File(...), modality: str = Form("auto"), engine: str = Form("auto"),
-                  phase: str = Form("ed"), iso_mm: float = Form(1.0)):
+                  phase: str = Form("ed"), iso_mm: float = Form(1.0), lge: Optional[UploadFile] = File(None),
+                  scar_method: str = Form("nsd"), scar_sd: float = Form(3.0)):
     job_id = uuid.uuid4().hex[:12]
     jdir = WORKDIR / job_id
     (jdir / "input").mkdir(parents=True)
-    name = Path(file.filename or "upload").name
-    dst = jdir / name
-    with open(dst, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    if name.endswith(".zip"):
-        with zipfile.ZipFile(dst) as zf:
-            _safe_extract(zf, jdir / "input")
-        inp = jdir / "input"
-    else:
-        inp = dst
+
+    def store(upload, sub):
+        name = Path(upload.filename or "upload").name
+        dst = jdir / f"{sub}_{name}"
+        with open(dst, "wb") as f:
+            shutil.copyfileobj(upload.file, f)
+        if name.endswith(".zip"):
+            (jdir / sub).mkdir(exist_ok=True)
+            with zipfile.ZipFile(dst) as zf:
+                _safe_extract(zf, jdir / sub)
+            return jdir / sub
+        return dst
+
+    inp = store(file, "input")
     JOBS[job_id] = {"status": "queued", "dir": jdir, "log": []}
     params = dict(modality=modality, engine=engine, phase=phase, iso_mm=iso_mm)
+    if lge is not None and lge.filename:
+        params.update(lge=str(store(lge, "lge")), scar_method=scar_method, scar_n_sd=scar_sd)
     threading.Thread(target=_worker, args=(job_id, str(inp), params), daemon=True).start()
     return {"job": job_id}
 
@@ -89,6 +98,8 @@ def job(job_id: str):
     if j.get("report"):
         out["qc"] = j["report"]["qc"]
         out["structures"] = {k: v["volume_ml"] for k, v in j["report"]["structures"].items()}
+        if "scar" in j["report"]:
+            out["scar"] = j["report"]["scar"]
     return out
 
 
@@ -101,11 +112,13 @@ def job_file(job_id: str, name: str):
     if name == "bundle.zip":
         z = j["dir"] / "bundle.zip"
         with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in ("heart.usda", "heart_labels.nii.gz", "heart_labels.json", "imaging_report.json"):
+            for f in ("heart.usda", "heart_labels.nii.gz", "heart_labels.json", "imaging_report.json",
+                      "scar_labels.nii.gz"):
                 if (out / f).exists():
                     zf.write(out / f, f)
         return FileResponse(z)
-    if name not in ("heart.usda", "heart_labels.nii.gz", "heart_labels.json", "imaging_report.json"):
+    if name not in ("heart.usda", "heart_labels.nii.gz", "heart_labels.json", "imaging_report.json",
+                    "scar_labels.nii.gz"):
         raise HTTPException(404, "unknown file")
     return FileResponse(out / name)
 

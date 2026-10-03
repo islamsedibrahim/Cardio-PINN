@@ -38,13 +38,22 @@ def main(argv=None):
     ap.add_argument("--field", default="transmembrane_potential")
     ap.add_argument("--role", action="append", default=[], help="override, e.g. Myocardium=/World/Heart/LV_wall")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--end-diastolic", action="store_true",
+                    help="the heart is an end-diastolic image: recover the unloaded heart and fit passive stiffness")
+    ap.add_argument("--edp", type=float, default=10.0, help="LV end-diastolic pressure (mmHg)")
+    ap.add_argument("--rv-edp", type=float, default=5.0, help="RV end-diastolic pressure (mmHg)")
+    ap.add_argument("--measured-edv", type=float, default=None, help="measured LVEDV (mL) at --edp")
+    ap.add_argument("--lv-only", action="store_true", help="do not simulate the RV")
+    ap.add_argument("--crt-study", action="store_true", help="LV lead sweep for CRT (scar-aware)")
     ap.add_argument("--dashboard", default=None, help="Echocardiology dashboard URL (echo EF in, report out)")
     args = ap.parse_args(argv)
 
     stage = Usd.Stage.Open(args.usd)
     cfg = PipelineConfig(element_size_mm=args.element_size, mechanics_dt_ms=args.dt, target_ef_pct=args.target_ef,
                          surrogate_epochs=args.epochs, display_field=args.field, output_dir=args.out,
-                         dashboard_url=args.dashboard)
+                         dashboard_url=args.dashboard, edp_mmhg=args.edp, rv_edp_mmhg=args.rv_edp,
+                         measured_edv_ml=args.measured_edv, biventricular=not args.lv_only,
+                         geometry_state="end_diastolic" if args.end_diastolic else "unloaded")
     cfg.ep.protocol = args.protocol
     cfg.ep.solver = args.ep_solver
     pipe = CardioSolvPipeline(stage, args.prim, cfg)
@@ -61,6 +70,8 @@ def main(argv=None):
         if name == "discover" and "discover" in pipe.done:
             continue
         getattr(pipe, f"run_{name}")()
+        if name == "ep" and args.crt_study:
+            pipe.run_crt_study()
     if "twin" not in order:
         pipe.build_report()
         pipe.export()

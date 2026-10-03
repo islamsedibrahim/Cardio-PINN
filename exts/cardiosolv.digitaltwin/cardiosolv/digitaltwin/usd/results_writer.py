@@ -32,6 +32,7 @@ FIELD_STYLE = {
     "fiber_stress": ("kPa", "turbo"),
     "displacement": ("mm", "viridis"),
     "transmural": ("-", "viridis"),
+    "scar": ("0 healthy / 1 border zone / 2 core", "scar"),
 }
 
 

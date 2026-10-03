@@ -231,6 +231,9 @@ def simulate_cycle(model: MechanicsModel, circ: CirculationParams = None, t_scal
         "peak_aortic_pressure_mmhg": float(np.max(PA)),
         "min_aortic_pressure_mmhg": float(np.min(np.array(PA)[beat])),
     }
+    tb = np.array(times)[beat]
+    # acute CRT response is classically judged by the change in LV dP/dt max (>= 10 %)
+    metrics["dpdt_max_mmhg_s"] = float(np.max(np.diff(P_arr[beat]) / (np.diff(tb) / 1000.0))) if beat.sum() > 1 else 0.0
     ff = np.stack(fields["fiber_strain"])
     metrics["peak_mean_fiber_strain"] = float(ff[beat].mean(1).min())
     metrics["myocardial_volume_change_pct"] = float(100 * (np.stack(fields["jacobian"]).mean(1).min() - 1))

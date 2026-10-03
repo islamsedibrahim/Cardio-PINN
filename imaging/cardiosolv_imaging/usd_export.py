@@ -7,6 +7,9 @@ Layout (part names follow TotalSegmentator, which CardioSolv recognises)::
         /Heart                   Xform  <- select this prim in the CardioSolv panel
           /heart_myocardium      Mesh
           /heart_ventricle_left  Mesh ...
+        /Scar                    Xform (LGE scar, optional)
+          /scar_core             Mesh  dense scar
+          /scar_border_zone      Mesh  border / grey zone
 """
 
 from __future__ import annotations
@@ -17,8 +20,11 @@ from pxr import Gf, Usd, UsdGeom, Vt
 from . import labels as L
 
 
-def write_heart_usd(path, surfaces: dict, meta: dict, center_heart=True):
-    """``surfaces``: {structure name: (points_ras_mm, faces)}."""
+SCAR_COLORS = {"scar_core": (0.95, 0.95, 0.95), "scar_border_zone": (0.95, 0.75, 0.3)}
+
+
+def write_heart_usd(path, surfaces: dict, meta: dict, center_heart=True, scar_surfaces: dict = None):
+    """``surfaces``: {structure name: (points_ras_mm, faces)}; ``scar_surfaces``: {scar_core|scar_border_zone: ...}."""
     stage = Usd.Stage.CreateNew(str(path))
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -54,5 +60,16 @@ def write_heart_usd(path, surfaces: dict, meta: dict, center_heart=True):
         p.SetCustomDataByKey("cardiosolv:structure", name)
         p.SetCustomDataByKey("cardiosolv:title", s.title)
         p.SetCustomDataByKey("cardiosolv:label", s.label)
+    if scar_surfaces:
+        scar = UsdGeom.Xform.Define(stage, "/World/Patient/Scar")
+        scar.GetPrim().SetCustomDataByKey("cardiosolv:source", "LGE")
+        for name, (pts, faces) in scar_surfaces.items():
+            mesh = UsdGeom.Mesh.Define(stage, f"/World/Patient/Scar/{name}")
+            mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy((pts / 1000.0).astype(np.float32)))
+            mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(faces)))
+            mesh.CreateFaceVertexIndicesAttr(Vt.IntArray(faces.reshape(-1).astype(int).tolist()))
+            mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+            mesh.CreateDisplayColorAttr([Gf.Vec3f(*SCAR_COLORS.get(name, (1, 1, 1)))])
+            mesh.GetPrim().SetCustomDataByKey("cardiosolv:structure", name)
     stage.GetRootLayer().Save()
     return str(path)

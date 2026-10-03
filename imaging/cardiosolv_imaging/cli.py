@@ -6,6 +6,7 @@ Examples::
     cardiosolv-segment /data/cine_sa -o out/p02 --modality MR --phase ed           # cine MR, end-diastole
     cardiosolv-segment ct.nii.gz -o out/p03 --engine totalsegmentator
     cardiosolv-segment ct.nii.gz -o out/p04 --label-map seg.nii.gz --mapping acdc   # your own segmentation
+    cardiosolv-segment /data/cine_sa -o out/p05 --lge /data/lge_sa                  # + scar from LGE MR
     cardiosolv-segment --check                                                      # which engines can run here
 """
 
@@ -27,6 +28,10 @@ def main(argv=None):
     ap.add_argument("--phase", default="ed", help="cine MR phase: ed | es | <index>")
     ap.add_argument("--iso", type=float, default=1.0, help="isotropic resolution for surfaces (mm)")
     ap.add_argument("--device", default="gpu")
+    ap.add_argument("--lge", default=None, help="LGE MR (DICOM folder or NIfTI) of the same examination: scar")
+    ap.add_argument("--scar-method", default="nsd", choices=["nsd", "fwhm"])
+    ap.add_argument("--scar-sd", type=float, default=3.0, help="n-SD scar threshold above remote myocardium")
+    ap.add_argument("--scar-labels", default=None, help="existing scar label map (1 border zone, 2 core)")
     ap.add_argument("--check", action="store_true", help="report available engines and exit")
     ap.add_argument("--json", action="store_true", help="print the full report as JSON")
     args = ap.parse_args(argv)
@@ -42,7 +47,8 @@ def main(argv=None):
 
     log = (lambda *a: print(*a, file=sys.stderr)) if args.json else print
     rep = run(args.input, args.out, args.modality, args.engine, args.label_map, args.mapping, args.phase,
-              args.iso, args.device, log=log)
+              args.iso, args.device, log=log, lge=args.lge, scar_method=args.scar_method,
+              scar_n_sd=args.scar_sd, scar_labels=args.scar_labels)
     if args.json:
         print(json.dumps(rep, default=str))
     else:

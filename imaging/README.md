@@ -29,6 +29,27 @@ DICOM folder (CT or cine/3D MR)
 | `superior_vena_cava`, `inferior_vena_cava`, `pulmonary_vein`, `atrial_appendage_left` | 125, 7, 119, 108 | ✓ | IVC | total |
 | `heart` (envelope) | 115 | ✓ | ✓ | total(_mr) |
 
+## Scar from LGE MR
+
+Add the late-gadolinium-enhancement series of the same examination:
+
+```bash
+cardiosolv-segment /data/p02/cine_SA -o out/p02 --modality MR --lge /data/p02/LGE_SA          # n-SD (default)
+cardiosolv-segment ct.nii.gz -o out/p06 --lge lge.nii.gz --scar-method fwhm
+cardiosolv-segment ct.nii.gz -o out/p07 --lge lge.nii.gz --scar-labels my_scar.nii.gz         # 1 = BZ, 2 = core
+```
+
+How the scar is found:
+- **Myocardium:** the anatomy's myocardium is resampled onto the LGE grid (scanner coordinates).
+- **Remote myocardium:** estimated by iterative 2-SD clipping.
+- **Scar:** remote mean + n·SD (default 3). Within it, the core is ≥ 50 % of the maximum scar intensity (FWHM); the rest is border zone. `fwhm` mode uses 35 % / 50 % of the maximum.
+- **Cleanup:** endocardial partial-volume rims and specks under 0.1 mL are removed.
+- **Output:** the result is interpolated to the isotropic grid by signed distance, clipped to the myocardium, and written to `scar_labels.nii.gz` and to `heart.usda` as `/World/Patient/Scar/{scar_core, scar_border_zone}`. The CardioSolv extension turns these into its scar substrate (EP block and slowing, contractility, conduction channels, CRT planning).
+
+The REST service accepts the LGE as a second upload (`lge=`). On the synthetic study (8 mm LGE
+slices, noise SD 10) the remote estimate is 48.9 ± 9.7 vs 50 ± 10 true, border zone 8.8 vs 8.9 mL,
+core 7.8 vs 9.2 mL.
+
 ## Deploy on a GPU host
 
 **Docker (recommended)**
@@ -77,6 +98,8 @@ stage at `/World/Patient/Heart` and selected for Stage 1.
   (8–10 mm) are interpolated through signed distances; the base may be truncated. A 3D
   whole-heart MR or a CT gives the most complete anatomy.
 * Enhanced multi-frame or compressed DICOM needs `SimpleITK` / `pylibjpeg` (`[dicom-extra]`).
+* LGE is not registered to the anatomy: use series from the same examination (breath-hold shifts
+  move the scar by a few mm). Thick LGE slices underestimate small cores.
 * This is an engineering reconstruction for simulation. It is not for diagnosis.
 
 ## Tests

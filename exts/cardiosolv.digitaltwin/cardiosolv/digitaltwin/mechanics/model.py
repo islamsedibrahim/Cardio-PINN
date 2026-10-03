@@ -82,7 +82,7 @@ def twitch(tau, apd, cfg: MechanicsConfig):
 
 class MechanicsModel:
     def __init__(self, mesh: TetMesh, coords: VentricularCoordinates, long_axis, cfg: MechanicsConfig = None,
-                 activation_time=None, apd=None):
+                 activation_time=None, apd=None, scar=None):
         if torch is None:
             raise RuntimeError("PyTorch is required for the biomechanics stage (bundled with Isaac Sim).")
         self.cfg = cfg or MechanicsConfig()
@@ -137,6 +137,11 @@ class MechanicsModel:
         self.epi_area_n = T(surf_n[epi])  # area-weighted normals
         # stress-free reference minus imaged node positions (mm); non-zero after passive.unload()
         self.offset = np.zeros_like(X)
+
+        # scar: per-element passive stiffness and contractility multipliers
+        self.scar = scar if scar is not None and scar.any else None
+        self.ta_el = np.ones(mesh.n_tets) if self.scar is None else self.scar.contractility()
+        self.stiff_el = T(np.ones(mesh.n_tets) if self.scar is None else self.scar.stiffness())
 
         # electromechanical coupling
         self.act_el = None
@@ -198,8 +203,8 @@ class MechanicsModel:
     def active_tension(self, t_ms, scale=1.0):
         """Element active tension (Pa) at time t."""
         if self.act_el is None:
-            return np.full(self.mesh.n_tets, scale * self.cfg.t_max_kpa * 1e3 * float(twitch(np.array([t_ms]), 280.0, self.cfg)[0]))
-        return scale * self.cfg.t_max_kpa * 1e3 * twitch(t_ms - self.act_el, self.apd_el, self.cfg)
+            return self.ta_el * scale * self.cfg.t_max_kpa * 1e3 * float(twitch(np.array([t_ms]), 280.0, self.cfg)[0])
+        return self.ta_el * scale * self.cfg.t_max_kpa * 1e3 * twitch(t_ms - self.act_el, self.apd_el, self.cfg)
 
     def deformation_gradient(self, u):
         x = self.X + u
@@ -225,7 +230,7 @@ class MechanicsModel:
         psi = (m.a_iso / (2 * m.b_iso) * (ex(m.b_iso * (I1 - 3)) - 1)
                + m.a_f / (2 * m.b_f) * (ex(m.b_f * relu(I4f - 1) ** 2) - 1)
                + m.a_s / (2 * m.b_s) * (ex(m.b_s * relu(I4s - 1) ** 2) - 1)
-               + m.a_fs / (2 * m.b_fs) * (ex(m.b_fs * I8**2) - 1)) * m.stiff_scale
+               + m.a_fs / (2 * m.b_fs) * (ex(m.b_fs * I8**2) - 1)) * m.stiff_scale * self.stiff_el
         psi = psi + 0.5 * m.bulk * (J - 1) ** 2 + 1e3 * m.bulk * relu(0.3 - J) ** 3
         eta = self.cfg.eta_transverse
         psi_act = 0.5 * Ta * ((I4f - 1) + eta * ((I4s - 1) + (I4n - 1)))
@@ -317,7 +322,7 @@ class MechanicsModel:
         psi = (m.a_iso / (2 * m.b_iso) * (ex(m.b_iso * (I1 - 3)) - 1)
                + m.a_f / (2 * m.b_f) * (ex(m.b_f * relu(I4f - 1) ** 2) - 1)
                + m.a_s / (2 * m.b_s) * (ex(m.b_s * relu(I4s - 1) ** 2) - 1)
-               + m.a_fs / (2 * m.b_fs) * (ex(m.b_fs * I8**2) - 1)) * m.stiff_scale
+               + m.a_fs / (2 * m.b_fs) * (ex(m.b_fs * I8**2) - 1)) * m.stiff_scale * self.stiff_el[None]
         psi = psi + 0.5 * m.bulk * (J - 1) ** 2 + 1e3 * m.bulk * relu(0.3 - J) ** 3
         psi = psi + 0.5 * Ta * ((I4f - 1) + self.cfg.eta_transverse * ((I4s - 1) + (I4n - 1)))
         W = (psi * self.vol[None]).sum(1)
@@ -353,7 +358,7 @@ class MechanicsModel:
             m = self.cfg.material
             I4 = lam**2 * torch.clamp(J, min=1e-6) ** (-2.0 / 3.0)
             # passive fibre stress (dominant HO fibre term) + active, pushed forward
-            dpsi = m.stiff_scale * m.a_f * torch.relu(I4 - 1) * torch.exp(torch.clamp(m.b_f * torch.relu(I4 - 1) ** 2, max=40))
+            dpsi = m.stiff_scale * self.stiff_el * m.a_f * torch.relu(I4 - 1) * torch.exp(torch.clamp(m.b_f * torch.relu(I4 - 1) ** 2, max=40))
             Ta_t = torch.as_tensor(Ta, dtype=self.dtype, device=self.device)
             sigma_ff = (2 * dpsi + Ta_t) * lam**2 / torch.clamp(J, min=1e-6)
             return {
