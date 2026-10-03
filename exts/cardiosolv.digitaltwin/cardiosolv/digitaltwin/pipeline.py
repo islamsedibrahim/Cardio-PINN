@@ -469,6 +469,8 @@ class CardioSolvPipeline:
         d = self.passive["diastolic"]
         self.log(f"    stiffness x{self.passive['stiff_scale']:.2f}; unloaded LV {d['model_v0_ml']:.1f} mL "
                  f"(Klotz {d['klotz_v0_ml']:.1f}), EDPVR RMS error {d['edpvr_rms_error_ml']:.1f} mL")
+        if not self.cfg.target_ef_pct:
+            self.log("    note: passive stiffness changed; set a target EF so contractility is re-personalised")
         return self.passive
 
     def run_mechanics(self):

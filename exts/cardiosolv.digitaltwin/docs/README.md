@@ -190,7 +190,12 @@ starts from the unloaded heart. Displacements stay relative to your imaged mesh,
 painted and animated on your model and passes through it at end-diastole.
 
 On the synthetic heart (taken as an ED image at 10 mmHg) the model EDPVR matches Klotz to
-0.6 mL RMS from 0 to 30 mmHg; the unloaded LV is 28.9 mL vs Klotz' 28.9 mL.
+0.6 mL RMS from 0 to 30 mmHg; the unloaded LV is 28.9 mL vs Klotz' 28.9 mL, and the beat refills it to
+53.2 mL at 10 mmHg (image 53.4 mL).
+
+**Re-personalise contractility afterwards.** A fitted (usually softer) myocardium with the default
+peak active tension ejects more. Enter the patient's EF (*Target EF*, `target_ef_pct`, or the echo
+LVEF from the dashboard) so the surrogate re-scales contractility to it.
 
 ## Physics
 
