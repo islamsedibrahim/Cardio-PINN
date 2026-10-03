@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1
+- **Patient data** form at the top of the panel (DICOM / NIfTI / heart.usda and LGE with *Browse*,
+  heart rate, aortic diastolic pressure, LV / RV EDP, measured LVEDV and LVEF, geometry state,
+  rhythm, *Run All Stages with this data*); its fields share models with the stage sections.
+- The window docks on the right and takes focus; a *CardioSolv* menu is added; a panel that fails to
+  build is reported in the console instead of failing silently.
+- `scripts/open_cardiosolv.py`: enable and open the extension from the Script Editor.
+- Step-by-step installation instructions (search path, filters, autoload, console).
+
 ## 0.6.0
 - Biventricular twin (default): RV free wall from an RV myocardium part or derived around the RV
   blood pool, one conforming LV/RV mesh with regions, two transmural fields and RV fibres, separate

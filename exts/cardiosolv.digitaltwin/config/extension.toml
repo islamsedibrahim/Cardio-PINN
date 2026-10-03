@@ -1,5 +1,5 @@
 [package]
-version = "0.6.0"
+version = "0.6.1"
 title = "CardioSolv Digital Twin"
 description = "Turns the heart you select in the stage into a biomechanical and electrophysiological digital twin: finds the myocardium, separates endo/epicardium, estimates the long axis, meshes, simulates (EP + Holzapfel-Ogden mechanics + Windkessel + Cardio-PINN surrogate) and paints/animates the results on your own mesh."
 category = "Simulation"

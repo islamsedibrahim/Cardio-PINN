@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import traceback
 from functools import partial
 
@@ -59,6 +60,7 @@ class CardioSolvPanel:
         self._plots_frame = {}
         self._pending_progress = {}
         self._log_dirty = False
+        self._models = {}  # shared value models: the Patient data form and the stage sections stay in sync
         self._update_sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
             self._on_update, name="cardiosolv.ui")
 
@@ -67,7 +69,11 @@ class CardioSolvPanel:
         if self.window:
             self.window.visible = True
             return
-        self.window = ui.Window("CardioSolv Digital Twin", width=520, height=900)
+        try:
+            self.window = ui.Window("CardioSolv Digital Twin", width=560, height=900,
+                                    dockPreference=ui.DockPreference.RIGHT_TOP)
+        except Exception:
+            self.window = ui.Window("CardioSolv Digital Twin", width=560, height=900)
         with self.window.frame:
             with ui.ScrollingFrame():
                 with ui.VStack(spacing=6, height=0):
@@ -81,6 +87,7 @@ class CardioSolvPanel:
                     with ui.HStack(height=26, spacing=6):
                         ui.Button("Run All Stages", clicked_fn=lambda: self._spawn(self._run_all()))
                         ui.Button("Clear Results", clicked_fn=self._clear_results, width=120)
+                    self._build_patient_data()
                     self._build_stage_imaging()
                     self._build_stage_discover()
                     self._build_stage_geometry()
@@ -91,6 +98,11 @@ class CardioSolvPanel:
                     self._build_stage_twin()
                     with ui.CollapsableFrame("Log", collapsed=False, height=0):
                         self._labels["log"] = ui.Label("", word_wrap=True, height=0, style={"font_size": 13})
+        self.window.visible = True
+        try:
+            self.window.focus()
+        except Exception:
+            pass
 
     def _stage_header(self, name):
         frame = ui.CollapsableFrame(STAGE_TITLES[name], collapsed=name not in ("imaging", "discover"), height=0)
@@ -102,13 +114,94 @@ class CardioSolvPanel:
             self._labels[f"{name}_status"] = ui.Label("not run", width=0)
             self._progress[name] = ui.ProgressBar(height=16)
 
-    def _float_field(self, label, value, key, width=90):
+    def _model(self, key, value, kind="float", setter=None):
+        """One value model per setting, shared by every widget that edits it."""
+        m = self._models.get(key)
+        if m is None:
+            if kind == "float":
+                m = ui.SimpleFloatModel(float(value or 0.0))
+                fn = setter or (lambda v, k=key: self._set_cfg(k, v))
+                m.add_value_changed_fn(lambda mm: fn(mm.as_float))
+            else:
+                m = ui.SimpleStringModel(value or "")
+                fn = setter or (lambda v, k=key: self._set_cfg(k, v))
+                m.add_value_changed_fn(lambda mm: fn(mm.as_string))
+            self._models[key] = m
+        return m
+
+    def _float_field(self, label, value, key, width=90, setter=None, tooltip=""):
         with ui.HStack(height=22):
-            ui.Label(label, width=220)
-            f = ui.FloatField(width=width)
-            f.model.set_value(float(value))
-            f.model.add_value_changed_fn(lambda m, k=key: self._set_cfg(k, m.as_float))
+            ui.Label(label, width=220, tooltip=tooltip)
+            f = ui.FloatField(model=self._model(key, value, "float", setter), width=width)
         return f
+
+    def _path_field(self, label, key, setter, tooltip=""):
+        with ui.HStack(height=22, spacing=4):
+            ui.Label(label, width=220, tooltip=tooltip)
+            m = self._model(key, "", "string", setter)
+            ui.StringField(model=m)
+            ui.Button("Browse", width=60, clicked_fn=lambda mm=m: self._browse(mm))
+        return m
+
+    def _browse(self, model):
+        try:
+            from omni.kit.window.filepicker import FilePickerDialog
+        except ImportError:
+            self._log("File picker not available: type or paste the path instead.")
+            return
+        holder = {}
+
+        def on_apply(filename, dirname):
+            path = os.path.join(dirname, filename) if filename else dirname
+            model.set_value(path)
+            holder["dlg"].hide()
+
+        holder["dlg"] = FilePickerDialog("CardioSolv: select a DICOM folder, NIfTI or USD file",
+                                         apply_button_label="Select", click_apply_handler=on_apply)
+        holder["dlg"].show()
+
+    @staticmethod
+    def _none_if_zero(v):
+        return v if v else None
+
+    def _build_patient_data(self):
+        """Everything the user enters about the patient, in one place at the top of the panel."""
+        with ui.CollapsableFrame("Patient data (your inputs)", collapsed=False, height=0):
+            with ui.VStack(spacing=4, height=0):
+                ui.Label("1. Heart: segment your DICOM (Stage 0), load a heart.usda, or select a heart already "
+                         "in the stage.", word_wrap=True, height=0, style={"color": 0xFFAAAAAA})
+                self._path_field("CT / MR DICOM folder, NIfTI or heart.usda", "imaging_input",
+                                 lambda v: setattr(self, "imaging_input", v))
+                self._path_field("LGE MR folder / NIfTI (scar, optional)", "lge",
+                                 lambda v: setattr(self.icfg, "lge", v.strip() or None))
+                with ui.HStack(height=26, spacing=4):
+                    ui.Button("Segment & Load Heart", clicked_fn=lambda: self._spawn(self._run_imaging()))
+                    ui.Button("Load heart.usda", clicked_fn=self._load_existing_heart)
+                    ui.Button("Use Selected Heart", clicked_fn=self._use_selection)
+                ui.Label("2. Measurements (echo / catheter / cuff). Leave 0 when unknown.", word_wrap=True,
+                         height=0, style={"color": 0xFFAAAAAA})
+                self._float_field("Heart rate (bpm)", 60000.0 / self.cfg.cycle_ms, "heart_rate",
+                                  setter=self._set_heart_rate)
+                self._float_field("Aortic diastolic pressure (mmHg)", self.cfg.p_aortic_diastolic, "p_aortic_diastolic")
+                self._float_field("LV end-diastolic pressure (mmHg)", self.cfg.edp_mmhg, "edp_mmhg")
+                self._float_field("RV end-diastolic pressure (mmHg)", self.cfg.rv_edp_mmhg, "rv_edp_mmhg")
+                self._float_field("Measured LVEDV (mL)", 0.0, "measured_edv_ml",
+                                  setter=lambda v: self._set_cfg("measured_edv_ml", self._none_if_zero(v)))
+                self._float_field("Measured LVEF (%) -> personalise", 0.0, "target_ef_pct",
+                                  setter=lambda v: self._set_cfg("target_ef_pct", self._none_if_zero(v)))
+                states = ["unloaded", "end_diastolic", "auto"]
+                self._combo("Imaged geometry is", states, self.cfg.geometry_state,
+                            lambda v: self._set_cfg("geometry_state", v))
+                protos = list(PACING_PROTOCOLS)
+                self._combo("Rhythm / pacing", protos, self.cfg.ep.protocol, lambda v: self._set_cfg("ep.protocol", v))
+                ui.Button("3. Run All Stages with this data", height=30, clicked_fn=lambda: self._spawn(self._run_all()))
+
+    def _set_heart_rate(self, bpm):
+        if bpm and bpm > 20:
+            self.cfg.cycle_ms = 60000.0 / bpm
+            m = self._models.get("cycle_ms")
+            if m is not None and abs(m.as_float - self.cfg.cycle_ms) > 1e-6:
+                m.set_value(self.cfg.cycle_ms)
 
     def _set_cfg(self, key, value):
         obj = self.cfg
@@ -139,12 +232,13 @@ class CardioSolvPanel:
                 ui.Label("Segment the heart and great vessels from a CT or MR DICOM folder (or NIfTI) with "
                          "NV-Segment-CTMR / TotalSegmentator, reconstruct it as USD and load it here. "
                          "Skip this stage if your heart is already in the stage.", word_wrap=True)
-                self._string_field("DICOM folder / NIfTI / heart.usda", "", lambda v: setattr(self, "imaging_input", v))
+                self._path_field("DICOM folder / NIfTI / heart.usda", "imaging_input",
+                                 lambda v: setattr(self, "imaging_input", v))
                 self._combo("Run segmentation", IMG_MODES, ic.mode, lambda v: setattr(ic, "mode", v))
                 self._combo("Modality", IMG_MODALITIES, ic.modality, lambda v: setattr(ic, "modality", v))
                 self._combo("Engine", IMG_ENGINES, ic.engine, lambda v: setattr(ic, "engine", v))
                 self._string_field("Cine MR phase (ed / es / index)", ic.phase, lambda v: setattr(ic, "phase", v or "ed"))
-                self._string_field("LGE MR (DICOM / NIfTI, optional)", "", lambda v: setattr(ic, "lge", v.strip() or None))
+                self._path_field("LGE MR (DICOM / NIfTI, optional)", "lge", lambda v: setattr(ic, "lge", v.strip() or None))
                 self._combo("LGE scar method", ["nsd", "fwhm"], ic.scar_method, lambda v: setattr(ic, "scar_method", v))
                 self._string_field("Local: imaging Python", ic.python, lambda v: setattr(ic, "python", v or "python"))
                 self._string_field("Local: imaging package dir", ic.package_dir,
@@ -159,7 +253,7 @@ class CardioSolvPanel:
     async def _run_imaging(self):
         import os
 
-        src = self.imaging_input.strip()
+        src = os.path.expanduser(self.imaging_input.strip().strip('"'))
         if not src or not os.path.exists(src):
             self._log("Enter an existing DICOM folder or NIfTI file for Stage 0.")
             return
@@ -193,7 +287,7 @@ class CardioSolvPanel:
     def _load_existing_heart(self):
         import os
 
-        path = self.imaging_input.strip()
+        path = os.path.expanduser(self.imaging_input.strip().strip('"'))
         if not path.lower().endswith((".usd", ".usda", ".usdc", ".usdz")) or not os.path.isfile(path):
             self._log("Enter the path of a heart.usda produced by cardiosolv-segment.")
             return
@@ -306,10 +400,8 @@ class CardioSolvPanel:
                     ui.Label("Passive stiffness fit", width=220)
                     c = ui.ComboBox(0, *calib)
                     c.model.add_item_changed_fn(lambda m, _: self._set_cfg("passive_calibration", calib[_combo_value(m)]))
-                with ui.HStack(height=22):
-                    ui.Label("Measured LVEDV (mL, 0 = none)", width=220)
-                    f = ui.FloatField(width=90)
-                    f.model.add_value_changed_fn(lambda m: self._set_cfg("measured_edv_ml", m.as_float or None))
+                self._float_field("Measured LVEDV (mL, 0 = none)", 0.0, "measured_edv_ml",
+                                  setter=lambda v: self._set_cfg("measured_edv_ml", self._none_if_zero(v)))
                 ui.Label("Right heart (biventricular twins)", height=18)
                 self._float_field("RV end-diastolic pressure (mmHg)", self.cfg.rv_edp_mmhg, "rv_edp_mmhg")
                 self._float_field("Pulmonary resistance (mmHg s/mL)", self.cfg.pvr, "pvr")
@@ -326,11 +418,8 @@ class CardioSolvPanel:
         with self._stage_header("surrogate"):
             with ui.VStack(spacing=4, height=0):
                 self._float_field("Training epochs", self.cfg.surrogate_epochs, "surrogate_epochs")
-                with ui.HStack(height=22):
-                    ui.Label("Target EF from echo (%, 0 = off)", width=220)
-                    f = ui.FloatField(width=90)
-                    f.model.set_value(0.0)
-                    f.model.add_value_changed_fn(lambda m: self._set_cfg("target_ef_pct", m.as_float or None))
+                self._float_field("Target EF from echo (%, 0 = off)", 0.0, "target_ef_pct",
+                                  setter=lambda v: self._set_cfg("target_ef_pct", self._none_if_zero(v)))
                 with ui.HStack(height=22):
                     ui.Label("Echo dashboard URL (optional)", width=220)
                     sf = ui.StringField()
