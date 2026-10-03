@@ -100,7 +100,17 @@ def main():
                 shutil.rmtree(holder if os.path.basename(holder).startswith(EXT_ID) else c, ignore_errors=True)
     mgr.add_path(TARGET_ROOT)
 
-    # 3. autoload at startup (same setting the Extension Manager's AUTOLOAD toggle writes)
+    # 3. drop empty search-path rows ("Failed to add extension path: ''" at every start) and
+    #    turn on autoload (same setting the Extension Manager's AUTOLOAD toggle writes)
+    try:
+        s = carb.settings.get_settings()
+        for key in ("/persistent/app/exts/userFolders", "/app/exts/userFolders"):
+            folders = s.get(key)
+            if isinstance(folders, (list, tuple)) and any(not str(f).strip() for f in folders):
+                s.set(key, [f for f in folders if str(f).strip()])
+                print(f"[CardioSolv] removed empty extension search path entries from {key}")
+    except Exception as exc:
+        print(f"[CardioSolv] could not clean search paths ({exc})")
     try:
         s = carb.settings.get_settings()
         key = "/persistent/app/exts/enabled"
