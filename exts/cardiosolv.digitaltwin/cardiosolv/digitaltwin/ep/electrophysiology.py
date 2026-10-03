@@ -34,22 +34,23 @@ PACING_PROTOCOLS: Dict[str, dict] = {
         "description": "Normal sinus rhythm: LV septal + antero/postero-paraseptal Purkinje breakthroughs (Durrer 1970)",
         "sites": [("endo", 0.55, 0.00, 0.0), ("endo", 0.65, 0.15, 2.0), ("endo", 0.65, 0.85, 2.0),
                   ("rv_septum", 0.50, 0.00, 5.0)],
-        "purkinje": True,
+        "purkinje": {"lv": True, "rv": True},
     },
     "lbbb": {
-        "description": "Left bundle branch block: activation enters from the RV septum, no LV Purkinje",
+        "description": "Left bundle branch block: activation enters from the RV septum, no LV Purkinje "
+                       "(the right bundle and RV Purkinje still conduct)",
         "sites": [("rv_septum", 0.50, 0.00, 0.0)],
-        "purkinje": False,
+        "purkinje": {"lv": False, "rv": True},
     },
     "rv_apical_pacing": {
-        "description": "RV apical pacing lead",
+        "description": "RV apical pacing lead (myocardial capture; the intact right bundle conducts retrogradely)",
         "sites": [("rv_septum", 0.15, 0.00, 0.0)],
-        "purkinje": False,
+        "purkinje": {"lv": False, "rv": True},
     },
     "crt": {
         "description": "Cardiac resynchronisation: RV septal + LV lateral epicardial lead in LBBB",
         "sites": [("rv_septum", 0.45, 0.00, 0.0), ("epi", 0.55, 0.50, 0.0)],
-        "purkinje": False,
+        "purkinje": {"lv": False, "rv": True},
     },
 }
 
@@ -109,6 +110,9 @@ def _site_nodes(mesh: TetMesh, coords: VentricularCoordinates, sets, set_name, x
     nodes = sets.get(set_name)
     if nodes is None or len(nodes) == 0:
         nodes = sets["endo"] if set_name != "epi" else sets["epi"]
+    if set_name == "rv_septum" and coords.node_region is not None:
+        septal = nodes[coords.node_region[nodes] == 0]  # RV endocardium on the septum, not the free wall
+        nodes = septal if len(septal) else nodes
     dc = np.abs(coords.x_c[nodes] - x_c)
     dc = np.minimum(dc, 1 - dc)
     score = (coords.x_l[nodes] - x_l) ** 2 + dc**2
@@ -138,6 +142,20 @@ def stimulus_sites(mesh, coords, cfg: EPConfig):
     return uniq, delays[order][first], proto["purkinje"]
 
 
+def purkinje_nodes(coords: VentricularCoordinates, cfg: EPConfig, purkinje) -> np.ndarray:
+    """Nodes of the fast subendocardial layer(s): ``purkinje`` is a bool or {"lv": bool, "rv": bool}."""
+    if isinstance(purkinje, dict):
+        lv, rv = bool(purkinje.get("lv")), bool(purkinje.get("rv"))
+    else:
+        lv = rv = bool(purkinje)
+    fast = np.zeros(len(coords.x_t), bool)
+    if lv:
+        fast |= (coords.x_t if coords.x_t_lv is None else coords.x_t_lv) <= cfg.endo_layer
+    if rv and coords.x_t_rv is not None:
+        fast |= coords.x_t_rv <= cfg.endo_layer
+    return fast
+
+
 def _edges(tets):
     e = np.concatenate([tets[:, [i, j]] for i in range(4) for j in range(i + 1, 4)])
     e.sort(axis=1)
@@ -153,8 +171,9 @@ def eikonal_activation(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPCon
     dl = np.einsum("ij,ij->i", d, f)
     dt2 = np.maximum(np.einsum("ij,ij->i", d, d) - dl**2, 0)
     w = np.sqrt(dl**2 / cfg.cv_fiber**2 + dt2 / cfg.cv_cross**2)
-    if purkinje:
-        fast = (coords.x_t[e[:, 0]] <= cfg.endo_layer) & (coords.x_t[e[:, 1]] <= cfg.endo_layer)
+    fn = purkinje_nodes(coords, cfg, purkinje)
+    if fn.any():
+        fast = fn[e[:, 0]] & fn[e[:, 1]]
         w[fast] /= cfg.purkinje_speedup
     # Kuhn/structured graphs overestimate straight-line paths by ~6%
     w *= 0.94
@@ -171,11 +190,11 @@ def apd_map(coords: VentricularCoordinates, cfg: EPConfig):
     return (cfg.apd_endo + (cfg.apd_epi - cfg.apd_endo) * coords.x_t + cfg.apd_apex_base * coords.x_l)
 
 
-def conductivity_tensors(coords: VentricularCoordinates, d_f, d_t, endo_factor=1.0, endo_layer=0.0, tets=None):
+def conductivity_tensors(coords: VentricularCoordinates, d_f, d_t, endo_factor=1.0, fast_nodes=None, tets=None):
     f = coords.fiber
     D = d_t * np.eye(3)[None] + (d_f - d_t) * np.einsum("ei,ej->eij", f, f)
-    if endo_factor != 1.0 and tets is not None:
-        endo = coords.x_t[tets].mean(1) <= endo_layer
+    if endo_factor != 1.0 and tets is not None and fast_nodes is not None:
+        endo = fast_nodes[tets].mean(1) >= 0.5
         D[endo] *= endo_factor
     return D
 
@@ -188,7 +207,8 @@ def monodomain(mesh: TetMesh, coords: VentricularCoordinates, cfg: EPConfig, sti
     c = 0.47
     d_f = (cfg.cv_fiber / c) ** 2 * tau_in
     d_t = (cfg.cv_cross / c) ** 2 * tau_in
-    D = conductivity_tensors(coords, d_f, d_t, cfg.purkinje_speedup**2 if purkinje else 1.0, cfg.endo_layer, mesh.tets)
+    D = conductivity_tensors(coords, d_f, d_t, cfg.purkinje_speedup**2, purkinje_nodes(coords, cfg, purkinje),
+                             mesh.tets)
     K = stiffness_matrix(mesh.points, mesh.tets, D)
     m = lumped_mass(mesh.points, mesh.tets)
     dt = cfg.dt
@@ -274,8 +294,9 @@ def run_electrophysiology(mesh: TetMesh, coords: VentricularCoordinates, cfg: EP
         log(f"EP warning: {(~finite).sum()} nodes never activated")
         act[~finite] = np.nanmax(act[finite]) if finite.any() else 0.0
         rep[~np.isfinite(rep)] = act[~np.isfinite(rep)] + apd[~np.isfinite(rep)]
-    lateral = (np.abs(coords.x_c - 0.5) < 0.12) & (coords.x_l > 0.3) & (coords.x_l < 0.8)
-    septal = (np.minimum(coords.x_c, 1 - coords.x_c) < 0.08) & (coords.x_l > 0.3) & (coords.x_l < 0.8)
+    lv = np.ones(len(act), bool) if coords.node_region is None else coords.node_region == 0
+    lateral = lv & (np.abs(coords.x_c - 0.5) < 0.12) & (coords.x_l > 0.3) & (coords.x_l < 0.8)
+    septal = lv & (np.minimum(coords.x_c, 1 - coords.x_c) < 0.08) & (coords.x_l > 0.3) & (coords.x_l < 0.8)
     metrics = {
         "total_activation_time_ms": float(act.max() - act.min()),
         "qrs_duration_ms": float(np.percentile(act, 98) - act.min()),
@@ -284,6 +305,14 @@ def run_electrophysiology(mesh: TetMesh, coords: VentricularCoordinates, cfg: EP
         "mean_apd_ms": float((rep - act).mean()),
         "stimulus_nodes": int(len(stim)),
     }
+    if coords.node_region is not None and (coords.node_region == 1).any():
+        rv = coords.node_region == 1
+        metrics.update({
+            "lv_total_activation_ms": float(act[lv].max() - act.min()),
+            "rv_total_activation_ms": float(act[rv].max() - act.min()),
+            # mean LV free-wall minus mean RV free-wall activation: >0 = LV late (LBBB), <0 = RV late (RBBB)
+            "interventricular_delay_ms": float(act[lateral].mean() - act[rv].mean()) if lateral.any() else 0.0,
+        })
     res = EPResult(activation_time=act, repolarization_time=rep, apd=rep - act, stim_nodes=stim, metrics=metrics,
                    config=asdict(cfg), vm_frames=frames, frame_times=times)
     if long_axis is not None:

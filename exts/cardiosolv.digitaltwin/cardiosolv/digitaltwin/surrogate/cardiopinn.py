@@ -6,7 +6,8 @@ Port of Buoso, Joyce & Kozerke (MedIA 2021) from TensorFlow 1.10 to PyTorch:
   this patient's mesh, instead of the shape-model functional bases, so it
   applies to any imported anatomy);
 * a small network ``(p_endo, t, s_act) -> a`` with Cardio-PINN's Swish
-  activation, output scaled by the amplitude range;
+  activation, output scaled by the amplitude range; biventricular twins take
+  both cavity pressures, ``(p_LV, p_RV, t, s_act) -> a``;
 * trained by minimising the total potential energy of ``u = Phi a``
   (Cardio-PINN ``CardioLoss``), optionally anchored to the FE snapshots;
 * coupled to the same Windkessel with Cardio-PINN's Newton/secant pressure
@@ -27,7 +28,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-from ..mechanics.cycle import CirculationParams, CycleResult
+from ..mechanics.cycle import Chamber, CirculationParams, CycleResult
 from ..mechanics.model import MMHG, MechanicsModel
 
 
@@ -40,6 +41,7 @@ class SurrogateConfig:
     batch: int = 16
     learning_rate: float = 2e-3
     p_max_mmhg: float = 180.0
+    p_max_rv_mmhg: float = 80.0  # RV pressure range sampled for biventricular twins
     t_max_ms: float = 500.0
     s_range: tuple = (0.4, 1.6)
     # FE-equilibrium anchoring (0 = pure physics as in Cardio-PINN). The reduced energy is as
@@ -58,16 +60,16 @@ class _Swish(torch.nn.Module if torch else object):
         return x * torch.sigmoid(30.0 * x)  # Cardio-PINN mySwish
 
 
-def _build_net(cfg: SurrogateConfig, n_out):
+def _build_net(cfg: SurrogateConfig, n_out, n_in=3):
     if cfg.use_physicsnemo:
         try:
             from physicsnemo.models.mlp.fully_connected import FullyConnected
 
-            return FullyConnected(in_features=3, out_features=n_out, num_layers=cfg.hidden_layers,
+            return FullyConnected(in_features=n_in, out_features=n_out, num_layers=cfg.hidden_layers,
                                   layer_size=cfg.hidden_neurons, activation_fn="silu"), "physicsnemo.FullyConnected"
         except Exception:
             pass
-    layers, d = [], 3
+    layers, d = [], n_in
     for _ in range(cfg.hidden_layers):
         lin = torch.nn.Linear(d, cfg.hidden_neurons)
         torch.nn.init.xavier_normal_(lin.weight)
@@ -90,16 +92,32 @@ class CardioPINNSurrogate:
         self.Phi = torch.as_tensor(Vt[:r].T.copy(), dtype=model.dtype, device=model.device)  # (3N, r)
         A = U @ Vt[:r].T  # snapshot amplitudes
         self.a_scale = torch.as_tensor(np.maximum(np.abs(A).max(0), 1e-6) * 1.5, dtype=model.dtype, device=model.device)
-        self.net, self.backbone = _build_net(self.cfg, r)
+        # FE displacements are relative to the imaged mesh; the energy needs them relative to the
+        # stress-free reference (they differ by model.offset after passive unloading)
+        self.offset = torch.as_tensor(model.offset, dtype=model.dtype, device=model.device)
+        self.K = model.n_cavities
+        self.p_max = [self.cfg.p_max_mmhg, self.cfg.p_max_rv_mmhg][: self.K]
+        self.net, self.backbone = _build_net(self.cfg, r, n_in=self.K + 2)
         self.net = self.net.to(model.device).double()
         # FE anchors
-        beat = fe.times > -1e9
-        self.anchor_x = torch.as_tensor(np.stack([fe.pressure_mmhg[beat] / self.cfg.p_max_mmhg,
-                                                  np.clip(fe.times[beat], 0, None) / self.cfg.t_max_ms,
-                                                  np.ones(beat.sum())], 1), dtype=model.dtype, device=model.device)
-        self.anchor_a = torch.as_tensor(A[beat], dtype=model.dtype, device=model.device)
+        self.fe_pressures = np.stack([fe.pressure_mmhg] + [fe.chambers[n]["pressure_mmhg"]
+                                                           for n in model.cavity_names[1:]], 1)  # (T,K)
+        self.anchor_x = self._x(self.fe_pressures, np.clip(fe.times, 0, None), np.ones(len(fe.times)))
+        self.anchor_a = torch.as_tensor(A, dtype=model.dtype, device=model.device)
         self.history = []
         self._fe = fe
+
+    def _x(self, ps, t_ms, s):
+        """Network input from pressures (B,K) mmHg, times (B,) ms and contractility scales (B,)."""
+        ps = np.atleast_2d(np.asarray(ps, float))
+        cols = [ps[:, k] / self.p_max[k] for k in range(self.K)]
+        cols += [np.asarray(t_ms, float).reshape(-1) / self.cfg.t_max_ms, np.asarray(s, float).reshape(-1)]
+        return torch.as_tensor(np.stack(np.broadcast_arrays(*cols), 1), dtype=self.model.dtype,
+                               device=self.model.device)
+
+    def _pressures(self, p_mmhg):
+        ps = np.atleast_1d(np.asarray(p_mmhg, float))
+        return np.concatenate([ps, np.zeros(self.K - len(ps))])[: self.K]
 
     def add_fe_anchors(self, log=print):
         """Equilibria at other contractilities (few FE solves) so the s-dependence is anchored."""
@@ -110,12 +128,12 @@ class CardioPINNSurrogate:
             for t in cfg.anchor_times_ms:
                 for pf in cfg.anchor_pressure_factors:
                     k = int(np.argmin(np.abs(fe.times - t) + (~beat) * 1e9))
-                    p = float(fe.pressure_mmhg[k]) * pf
-                    u, _, _, _ = self.model.solve(fe.displacements[k], self.model.active_tension(t, s), "pressure",
-                                                  p_pa=p * MMHG)
-                    a = u.reshape(-1) @ self.Phi.cpu().numpy()
-                    X.append(torch.tensor([[p / cfg.p_max_mmhg, t / cfg.t_max_ms, s]], dtype=self.model.dtype,
-                                          device=self.model.device))
+                    ps = self.fe_pressures[k] * pf
+                    u, _, _, _ = self.model.solve(fe.displacements[k] - self.model.offset,
+                                                  self.model.active_tension(t, s),
+                                                  loads=[("pressure", p * MMHG, 0.0, 0.0) for p in ps])
+                    a = (u + self.model.offset).reshape(-1) @ self.Phi.cpu().numpy()
+                    X.append(self._x(ps, t, s))
                     Y.append(torch.as_tensor(a[None], dtype=self.model.dtype, device=self.model.device))
         self.anchor_x, self.anchor_a = torch.cat(X), torch.cat(Y)
         log(f"surrogate: {len(self.anchor_x)} FE anchors ({len(cfg.anchor_scales) * len(cfg.anchor_times_ms) * len(cfg.anchor_pressure_factors)} new)")
@@ -125,18 +143,21 @@ class CardioPINNSurrogate:
         return self.net(x) * self.a_scale
 
     def displacement(self, p_mmhg, t_ms, s=1.0):
-        x = torch.tensor([[p_mmhg / self.cfg.p_max_mmhg, t_ms / self.cfg.t_max_ms, s]], dtype=self.model.dtype,
-                         device=self.model.device)
+        """``p_mmhg``: LV pressure, or [p_LV, p_RV] on biventricular twins."""
+        x = self._x(self._pressures(p_mmhg), t_ms, s)
         with torch.no_grad():
             a = self.amplitudes(x)
             return (a @ self.Phi.T).reshape(-1, 3).cpu().numpy()
 
-    def volume_ml(self, p_mmhg, t_ms, s=1.0):
-        x = torch.tensor([[p_mmhg / self.cfg.p_max_mmhg, t_ms / self.cfg.t_max_ms, s]], dtype=self.model.dtype,
-                         device=self.model.device)
+    def volumes_ml(self, p_mmhg, t_ms, s=1.0):
+        """Every cavity's volume (mL) at pressures ``p_mmhg`` (one per cavity)."""
+        x = self._x(self._pressures(p_mmhg), t_ms, s)
         with torch.no_grad():
-            U = (self.amplitudes(x) @ self.Phi.T).reshape(1, -1, 3)
-            return float(self.model.cavity_volume_batch(U)[0]) / 1000.0
+            U = (self.amplitudes(x) @ self.Phi.T).reshape(1, -1, 3) - self.offset
+            return np.array([float(self.model.cavity_volume_batch(U, k)[0]) / 1000.0 for k in range(self.K)])
+
+    def volume_ml(self, p_mmhg, t_ms, s=1.0):
+        return float(self.volumes_ml(p_mmhg, t_ms, s)[0])
 
     def _ta_batch(self, t_ms, s):
         return torch.stack([torch.as_tensor(self.model.active_tension(float(t), float(k)), dtype=self.model.dtype)
@@ -152,16 +173,15 @@ class CardioPINNSurrogate:
         if cfg.data_weight > 0 and cfg.anchor_scales and len(self.anchor_x) == len(self._fe.times):
             self.add_fe_anchors(log)
         for ep in range(cfg.epochs):
-            p = rng.uniform(0, cfg.p_max_mmhg, cfg.batch)
+            ps = np.stack([rng.uniform(0, pm, cfg.batch) for pm in self.p_max], 1)
             t = rng.uniform(0, cfg.t_max_ms, cfg.batch)
             s = rng.uniform(*cfg.s_range, cfg.batch)
-            x = torch.as_tensor(np.stack([p / cfg.p_max_mmhg, t / cfg.t_max_ms, s], 1), dtype=self.model.dtype,
-                                device=self.model.device)
+            x = self._x(ps, t, s)
             Ta = self._ta_batch(t, s)
             a = self.amplitudes(x)
-            U = (a @ self.Phi.T).reshape(cfg.batch, -1, 3)
-            Pi, _ = self.model.potential_batch(U, Ta, torch.as_tensor(p * MMHG, dtype=self.model.dtype,
-                                                                     device=self.model.device))
+            U = (a @ self.Phi.T).reshape(cfg.batch, -1, 3) - self.offset
+            p_t = torch.as_tensor(ps * MMHG, dtype=self.model.dtype, device=self.model.device)
+            Pi, _ = self.model.potential_batch(U, Ta, p_t if self.K > 1 else p_t[:, 0])
             # per-sample normalisation: each sample's minimiser is unchanged, but high-pressure
             # samples no longer dominate the gradient
             loss = (Pi / (Pi.detach().abs() + 1e-3 / scale)).mean()
@@ -181,7 +201,8 @@ class CardioPINNSurrogate:
 
     def state_dict(self):
         return {"net": self.net.state_dict(), "Phi": self.Phi.cpu(), "a_scale": self.a_scale.cpu(),
-                "config": asdict(self.cfg), "backbone": self.backbone, "pod_energy": self.pod_energy}
+                "config": asdict(self.cfg), "backbone": self.backbone, "pod_energy": self.pod_energy,
+                "cavities": list(self.model.cavity_names)}
 
 
 def _secant(fun, x0, x1, tol=0.05, it=30):
@@ -198,65 +219,78 @@ def _secant(fun, x0, x1, tol=0.05, it=30):
 
 
 def simulate_cycle_surrogate(sur: CardioPINNSurrogate, circ: CirculationParams = None, s_act=1.0, dt_ms=5.0,
-                             min_ejection_ms=40.0):
-    """Windkessel-coupled heartbeat using the surrogate's V(p, t, s) (milliseconds)."""
+                             min_ejection_ms=40.0, sweeps=3):
+    """Windkessel-coupled heartbeat using the surrogate's V_k(p_LV, p_RV, t, s) (milliseconds).
+
+    The surrogate's V(p, t) carries small noise, so a semilunar valve closes only on sustained
+    reverse flow after a minimum ejection period."""
     circ = circ or CirculationParams()
-    V = lambda p, t: sur.volume_ml(p, t, s_act)  # noqa: E731
-    edv = V(circ.edp, 0.0)
-    times, P, Vol, PA, phases = [0.0], [circ.edp], [edv], [circ.p_aortic_diastolic], ["ivc"]
-    p, p_c, phase, v_prev, v_ref = circ.edp, circ.p_aortic_diastolic, "ivc", edv, edv
-    beta = 1.0 / (1.0 + dt_ms / 1000.0 / (circ.r_periph * circ.c_art))
-    t_fill, p_fill = None, None
-    t_eject, reverse_steps = None, 0
+    K = sur.K
+    prm = circ.chambers(K)
+    ps = np.array([c["edp"] for c in prm], float)
+    v_ed = sur.volumes_ml(ps, 0.0, s_act)
+    ch = [Chamber(c, dt_ms, circ.cycle_ms, float(v), min_reverse_steps=2, min_ejection_ms=min_ejection_ms)
+          for c, v in zip(prm, v_ed)]
+    rows = [[(c["edp"], float(v), c["p_dia"], 0.0, "ivc")] for c, v in zip(prm, v_ed)]
+    times = [0.0]
+
+    def solve_step(t, ps):
+        ps = ps.copy()
+        for _ in range(sweeps if K > 1 else 1):  # Gauss-Seidel over the ventricles
+            for k, c in enumerate(ch):
+                def Vk(q, k=k):
+                    pp = ps.copy()
+                    pp[k] = q
+                    return sur.volumes_ml(pp, t, s_act)[k]
+
+                if c.phase in ("ivc", "ivr"):
+                    ps[k] = _secant(lambda q: Vk(q) - c.v_ref, ps[k], ps[k] + 5.0)
+                elif c.phase == "ejection":
+                    a, v_star = c.ejection_line()
+                    ps[k] = _secant(lambda q: q - a * (v_star - Vk(q)), ps[k], ps[k] + 5.0)
+                else:
+                    ps[k] = c.fill_pressure(t)
+        return ps, sur.volumes_ml(ps, t, s_act)
+
     n = int(circ.cycle_ms / dt_ms)
-    for k in range(1, n + 1):
-        t = k * dt_ms
-        for _ in range(3):
-            if phase in ("ivc", "ivr"):
-                p_new = _secant(lambda q: V(q, t) - v_ref, p, p + 5.0)
-                v = V(p_new, t)
-                p_c_new = beta * p_c
-                if phase == "ivc" and p_new >= p_c_new:
-                    phase, t_eject, reverse_steps = "ejection", t, 0
-                    continue
-                if phase == "ivr" and p_new <= circ.p_atrial:
-                    phase, t_fill, p_fill = "filling", t, max(p_new, 1.0)
-                    continue
-            elif phase == "ejection":
-                a = beta / circ.c_art + circ.z_char / (dt_ms / 1000.0)  # mmHg / mL
-                v_star = v_prev + beta * p_c / a
-                p_new = _secant(lambda q: q - a * (v_star - V(q, t)), p, p + 5.0)
-                v = V(p_new, t)
-                q_flow = (v_prev - v) / (dt_ms / 1000.0)
-                # the surrogate's V(p, t) carries small noise: close the aortic valve only on
-                # sustained reverse flow after a minimum ejection period
-                reverse_steps = reverse_steps + 1 if q_flow < 0 else 0
-                if reverse_steps >= 2 and t - t_eject >= min_ejection_ms:
-                    phase, v_ref = "ivr", v_prev
-                    continue
-                q_flow = max(q_flow, 0.0)
-                p_c_new = beta * (p_c + q_flow * dt_ms / 1000.0 / circ.c_art)
-            else:
-                frac = min((t - t_fill) / max(circ.cycle_ms - t_fill, dt_ms), 1.0)
-                p_new = p_fill + (circ.edp - p_fill) * frac
-                v = V(p_new, t)
-                p_c_new = beta * p_c
-            break
-        p, p_c, v_prev = p_new, p_c_new, v
+    for step in range(1, n + 1):
+        t = step * dt_ms
+        for _ in range(2 * K + 1):
+            ps_new, vs = solve_step(t, ps)
+            if not any([c.transition(t, p, v) for c, p, v in zip(ch, ps_new, vs)]):
+                break
+        ps = ps_new
+        for k, c in enumerate(ch):
+            rows[k].append(c.commit(float(ps[k]), float(vs[k])))
         times.append(t)
-        P.append(p)
-        Vol.append(v)
-        PA.append(p if phase == "ejection" else p_c)
-        phases.append(phase)
-    Vol = np.array(Vol)
+
+    def trace(r):
+        return {"pressure_mmhg": np.array([x[0] for x in r]), "volume_ml": np.array([x[1] for x in r]),
+                "arterial_mmhg": np.array([x[2] for x in r]), "flow_ml_s": np.array([x[3] for x in r]),
+                "phase": [x[4] for x in r]}
+
+    tr = [trace(r) for r in rows]
+    Vol, P = tr[0]["volume_ml"], tr[0]["pressure_mmhg"]
     edv_, esv = float(Vol[0]), float(Vol.min())
-    return {
-        "times": np.array(times), "pressure_mmhg": np.array(P), "volume_ml": Vol, "aortic_mmhg": np.array(PA),
-        "phase": phases,
+    out = {
+        "times": np.array(times), "pressure_mmhg": P, "volume_ml": Vol, "aortic_mmhg": tr[0]["arterial_mmhg"],
+        "phase": tr[0]["phase"],
         "metrics": {"edv_ml": edv_, "esv_ml": esv, "stroke_volume_ml": edv_ - esv,
                     "ejection_fraction_pct": 100 * (edv_ - esv) / edv_, "peak_lv_pressure_mmhg": float(np.max(P)),
                     "contractility_scale": s_act},
+        "chambers": {},
     }
+    for k in range(1, K):
+        c, name = tr[k], prm[k]["name"].lower()
+        out["chambers"][prm[k]["name"]] = c
+        v = c["volume_ml"]
+        out["metrics"].update({f"{name}_edv_ml": float(v[0]), f"{name}_esv_ml": float(v.min()),
+                               f"{name}_stroke_volume_ml": float(v[0] - v.min()),
+                               f"{name}_ejection_fraction_pct": float(100 * (v[0] - v.min()) / v[0]),
+                               f"peak_{name}_pressure_mmhg": float(c["pressure_mmhg"].max()),
+                               "pa_systolic_mmhg" if name == "rv" else f"{name}_peak_arterial_pressure_mmhg":
+                                   float(c["arterial_mmhg"].max())})
+    return out
 
 
 def calibrate_contractility(sur: CardioPINNSurrogate, target_ef_pct: float, circ: CirculationParams = None,

@@ -3,7 +3,9 @@
 A conforming Kuhn (6-tet) subdivision of the myocardial voxels is built at
 simulation resolution, its boundary nodes are snapped onto the user's own
 myocardium surface, and every boundary face inherits the endo / epi / base /
-septum classification of the geometry layer. When gmsh is available the
+septum classification of the geometry layer. Biventricular geometry layers
+mesh the LV wall + septum (region 0) and the RV free wall (region 1) as one
+conforming mesh; RV_SEPTUM faces are then the whole RV endocardium. When gmsh is available the
 caller can request it instead (``mesher="gmsh"``) for graded meshes.
 """
 
@@ -15,7 +17,8 @@ from typing import Dict, Optional
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .geometry_layer import BASE, ENDO, EPI, RV_SEPTUM, UNKNOWN, V_MYO, GeometryLayer, label_surface_faces
+from .geometry_layer import (BASE, ENDO, EPI, RV_SEPTUM, UNKNOWN, V_MYO, V_RV_MYO, WALL_CLASSES, GeometryLayer,
+                             label_surface_faces)
 from .mesh import SurfaceMesh
 from .voxel import VoxelGrid, largest_component
 
@@ -41,6 +44,20 @@ class TetMesh:
     face_labels: np.ndarray  # (F,) ENDO/EPI/BASE/RV_SEPTUM
     spacing: float
     metadata: dict = field(default_factory=dict)
+    tet_region: Optional[np.ndarray] = None  # (E,) 0 LV wall + septum, 1 RV free wall
+
+    @property
+    def biventricular(self) -> bool:
+        return self.tet_region is not None and bool((self.tet_region == 1).any())
+
+    def node_region(self) -> np.ndarray:
+        """1 for nodes used only by RV free-wall tets, else 0 (LV, septum and the LV/RV junction)."""
+        r = np.ones(self.n_nodes, np.int8)
+        if self.tet_region is None:
+            return np.zeros(self.n_nodes, np.int8)
+        r[np.unique(self.tets[self.tet_region == 0])] = 0
+        r[np.setdiff1d(np.arange(self.n_nodes), np.unique(self.tets))] = 0
+        return r
 
     @property
     def n_nodes(self):
@@ -61,18 +78,27 @@ class TetMesh:
         return np.unique(self.boundary_faces[sel])
 
     def node_sets(self) -> Dict[str, np.ndarray]:
-        return {"endo": self.node_set(ENDO), "epi": self.node_set(EPI, RV_SEPTUM), "base": self.node_set(BASE),
-                "rv_septum": self.node_set(RV_SEPTUM), "surface": np.unique(self.boundary_faces)}
+        sets = {"endo": self.node_set(ENDO), "base": self.node_set(BASE), "rv_septum": self.node_set(RV_SEPTUM),
+                "surface": np.unique(self.boundary_faces)}
+        if self.biventricular:
+            sets["epi"] = self.node_set(EPI)
+            sets["rv_endo"] = sets["rv_septum"]
+        else:
+            sets["epi"] = self.node_set(EPI, RV_SEPTUM)
+        return sets
 
     def boundary_surface(self) -> SurfaceMesh:
         return SurfaceMesh("myocardium_sim_surface", self.points, self.boundary_faces)
 
 
-def boundary_faces_of(tets: np.ndarray) -> np.ndarray:
+def boundary_faces_of(tets: np.ndarray, return_owner=False):
     faces = tets[:, TET_FACES].reshape(-1, 3)
     key = np.sort(faces, axis=1)
     _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
-    return faces[cnt[inv.ravel()] == 1]
+    sel = cnt[inv.ravel()] == 1
+    if return_owner:
+        return faces[sel], np.nonzero(sel)[0] // 4
+    return faces[sel]
 
 
 def voxel_tets(mask: np.ndarray, grid: VoxelGrid):
@@ -108,10 +134,14 @@ def _surface_samples(surface: SurfaceMesh, density_mm: float):
     return np.vstack(pts)
 
 
-def snap_to_surface(mesh: TetMesh, surface: SurfaceMesh, max_move_factor=0.9, iterations=4, labels=None):
-    """Move boundary nodes (optionally only those on faces with ``labels``) onto the user's surface
-    without inverting tets."""
-    faces = mesh.boundary_faces if labels is None else mesh.boundary_faces[np.isin(mesh.face_labels, labels)]
+def snap_to_surface(mesh: TetMesh, surface: SurfaceMesh, max_move_factor=0.9, iterations=4, labels=None,
+                    face_mask=None):
+    """Move boundary nodes (optionally only those on faces with ``labels`` / in ``face_mask``) onto the
+    user's surface without inverting tets."""
+    sel = np.ones(len(mesh.boundary_faces), bool) if labels is None else np.isin(mesh.face_labels, labels)
+    if face_mask is not None:
+        sel &= face_mask
+    faces = mesh.boundary_faces[sel]
     nodes = np.unique(faces)
     samples = _surface_samples(surface, mesh.spacing)
     tree = cKDTree(samples)
@@ -180,20 +210,43 @@ def build_tet_mesh(gl: GeometryLayer, myo_surface: Optional[SurfaceMesh], spacin
     centers = grid.centers(idx)
     # majority of 8 sub-samples per coarse voxel for a faithful resampling
     off = (np.array(_CORNERS, float) - 0.5) * 0.5 * spacing_mm
-    votes = sum((gl.grid.sample(gl.voxel_class, centers + o) == V_MYO).astype(int) for o in off)
+    biv = bool(getattr(gl, "biventricular", False))
+    if biv:
+        rvi = np.argwhere(gl.voxel_class == V_RV_MYO)
+        lo = np.minimum(lo, gl.grid.centers(rvi).min(0) - gl.grid.spacing)
+        hi = np.maximum(hi, gl.grid.centers(rvi).max(0) + gl.grid.spacing)
+        grid = VoxelGrid.around(lo, hi, spacing_mm, padding_voxels=1)
+        idx = np.argwhere(np.ones(grid.shape, bool))
+        centers = grid.centers(idx)
+    samples = [gl.grid.sample(gl.voxel_class, centers + o) for o in off]
+    lv_votes = sum((c == V_MYO).astype(int) for c in samples)
+    rv_votes = sum((c == V_RV_MYO).astype(int) for c in samples) if biv else 0 * lv_votes
     mask = np.zeros(grid.shape, bool)
-    mask[tuple(idx.T)] = votes >= 4
+    mask[tuple(idx.T)] = (lv_votes + rv_votes) >= 4
     mask = largest_component(mask, connectivity=1)
     if mask.sum() < 20:
         raise RuntimeError(f"Myocardium too thin for {spacing_mm} mm elements; reduce the element size.")
     pts, tets = voxel_tets(mask, grid)
-    bfaces = boundary_faces_of(tets)
+    bfaces, owner = boundary_faces_of(tets, return_owner=True)
+    region = None
+    if biv:
+        rv_vox = np.zeros(grid.shape, bool)
+        rv_vox[tuple(idx.T)] = rv_votes > lv_votes
+        region = np.repeat(rv_vox[mask].astype(np.int8), len(_KUHN))  # voxel_tets keeps argwhere order
     mesh = TetMesh(points=pts, tets=tets, boundary_faces=bfaces, face_labels=np.zeros(len(bfaces), np.int8),
-                   spacing=spacing_mm, metadata={"mesher": "voxel_kuhn", "voxels": int(mask.sum())})
+                   spacing=spacing_mm, metadata={"mesher": "voxel_kuhn", "voxels": int(mask.sum())},
+                   tet_region=region)
     surf = SurfaceMesh("vox", pts, bfaces)
-    mesh.face_labels = label_surface_faces(surf, gl.grid, gl.voxel_class, gl.long_axis)
+    mesh.face_labels = label_surface_faces(surf, gl.grid, gl.voxel_class, gl.long_axis,
+                                           wall_classes=WALL_CLASSES if biv else (V_MYO,))
     if myo_surface is not None:
-        snap_to_surface(mesh, myo_surface)
+        if biv:
+            # the user's surface covers the LV wall + septum; the derived RV wall is smoothed
+            lv_faces = region[owner] == 0
+            taubin_smooth_boundary(mesh, fixed=np.unique(bfaces[lv_faces]))
+            snap_to_surface(mesh, myo_surface, face_mask=lv_faces)
+        else:
+            snap_to_surface(mesh, myo_surface)
     elif skin_surface is not None:
         taubin_smooth_boundary(mesh, fixed=mesh.node_set(EPI))
         snap_to_surface(mesh, skin_surface, labels=(EPI,))
@@ -204,5 +257,8 @@ def build_tet_mesh(gl: GeometryLayer, myo_surface: Optional[SurfaceMesh], spacin
         "nodes": mesh.n_nodes, "tets": mesh.n_tets, "volume_ml": float(vols.sum() / 1000.0),
         "min_tet_volume_ratio": float(vols.min() / (spacing_mm**3 / 6.0)),
         "unlabelled_faces": int((mesh.face_labels == UNKNOWN).sum()),
+        "biventricular": mesh.biventricular,
     })
+    if mesh.biventricular:
+        mesh.metadata["rv_wall_volume_ml"] = float(vols[mesh.tet_region == 1].sum() / 1000.0)
     return mesh

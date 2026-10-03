@@ -1,4 +1,4 @@
-"""Stage 6a: hyperelastic LV mechanics on the user's myocardium (PyTorch).
+"""Stage 6a: hyperelastic ventricular mechanics on the user's myocardium (PyTorch).
 
 Total potential energy, as in Cardio-PINN (Buoso et al., MedIA 2021):
 
@@ -10,7 +10,9 @@ Total potential energy, as in Cardio-PINN (Buoso et al., MedIA 2021):
   with ``T_a`` per element driven by the EP activation time
   (electromechanical coupling).
 * ``Pi_cavity``: ``-p V`` (prescribed pressure) or ``alpha/2 (V* - V)^2``
-  (isovolumetric phases and 3-element Windkessel ejection, see ``cycle.py``).
+  (isovolumetric phases and 3-element Windkessel ejection, see ``cycle.py``),
+  one term per cavity: LV only, or LV + RV on biventricular meshes, so the
+  septum is loaded by both pressures.
 * ``Pi_bc``: basal longitudinal anchoring + pericardial springs.
 
 Equilibrium is found by L-BFGS on the nodal displacements. The same energy is
@@ -29,7 +31,7 @@ except ImportError:  # pragma: no cover - reported in the UI
     torch = None
 
 from ..core.coordinates import VentricularCoordinates
-from ..core.geometry_layer import ENDO
+from ..core.geometry_layer import ENDO, RV_SEPTUM
 from ..core.volume_mesh import TetMesh
 
 MMHG = 133.322  # Pa
@@ -100,23 +102,21 @@ class MechanicsModel:
         self.f0, self.s0, self.n0 = T(coords.fiber), T(coords.sheet), T(coords.normal)
         self.total_volume = float(self.vol.sum())
 
-        # cavity surface (endocardium) and its rim
+        # cavity surfaces (endocardia) and their rims: LV, and RV on biventricular meshes
         endo = mesh.boundary_faces[mesh.face_labels == ENDO]
         if len(endo) == 0:
             raise RuntimeError("No endocardial faces on the computational mesh.")
-        e = np.concatenate([endo[:, [0, 1]], endo[:, [1, 2]], endo[:, [2, 0]]])
-        key = np.sort(e, axis=1)
-        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
-        rim = np.unique(e[cnt[inv.ravel()] == 1])
-        if len(rim) < 3:
-            xl = long_axis.project(X[np.unique(endo)])
-            rim = np.unique(endo)[xl >= np.percentile(xl, 95)]
-        self.endo_faces = torch.as_tensor(endo, device=dev)
-        self.rim = torch.as_tensor(rim, device=dev)
-        self.cavity_sign = 1.0
-        v0 = float(self.cavity_volume(torch.zeros_like(self.X)))
-        self.cavity_sign = 1.0 if v0 > 0 else -1.0
-        self.V0 = abs(v0)
+        self.cavity_names = ["LV"]
+        self._faces, self._rims, self._signs = [], [], []
+        self._add_cavity(endo, long_axis)
+        if getattr(mesh, "biventricular", False):
+            rv_endo = mesh.boundary_faces[mesh.face_labels == RV_SEPTUM]
+            if len(rv_endo) >= 10:
+                self.cavity_names.append("RV")
+                self._add_cavity(rv_endo, long_axis)
+        self.V0s = [abs(float(self.cavity_volume(torch.zeros_like(self.X), k))) for k in range(self.n_cavities)]
+        self.V0 = self.V0s[0]
+        self.endo_faces, self.rim, self.cavity_sign = self._faces[0], self._rims[0], self._signs[0]
 
         # boundary conditions
         sets = mesh.node_sets()
@@ -135,6 +135,8 @@ class MechanicsModel:
         for k in range(3):
             np.add.at(surf_n, bf[:, k], fn)
         self.epi_area_n = T(surf_n[epi])  # area-weighted normals
+        # stress-free reference minus imaged node positions (mm); non-zero after passive.unload()
+        self.offset = np.zeros_like(X)
 
         # electromechanical coupling
         self.act_el = None
@@ -142,6 +144,55 @@ class MechanicsModel:
         if activation_time is not None:
             self.act_el = np.asarray(activation_time)[mesh.tets].mean(1)
             self.apd_el = np.asarray(apd)[mesh.tets].mean(1) if apd is not None else np.full(mesh.n_tets, 280.0)
+
+    def _add_cavity(self, faces, long_axis):
+        X = self.mesh.points
+        e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        key = np.sort(e, axis=1)
+        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+        rim = np.unique(e[cnt[inv.ravel()] == 1])
+        if len(rim) < 3:
+            xl = long_axis.project(X[np.unique(faces)])
+            rim = np.unique(faces)[xl >= np.percentile(xl, 95)]
+        self._faces.append(torch.as_tensor(faces, device=self.device))
+        self._rims.append(torch.as_tensor(rim, device=self.device))
+        self._signs.append(1.0)
+        v0 = float(self.cavity_volume(torch.zeros_like(self.X), len(self._faces) - 1))
+        self._signs[-1] = 1.0 if v0 > 0 else -1.0
+
+    def set_reference(self, X_ref):
+        """Use ``X_ref`` (N,3 mm) as the stress-free configuration (e.g. the unloaded heart recovered
+        from an end-diastolic image). Fibres are kept (Lagrangian), displacements reported to the
+        twin are ``u + offset`` so they stay relative to the imaged mesh."""
+        X_ref = np.asarray(X_ref, float)
+        p = X_ref[self.mesh.tets]
+        Dm = np.stack([p[:, 1] - p[:, 0], p[:, 2] - p[:, 0], p[:, 3] - p[:, 0]], axis=2)
+        det = np.linalg.det(Dm)
+        if (det <= 0).any():
+            raise RuntimeError(f"reference configuration has {(det <= 0).sum()} inverted elements")
+        T = lambda a: torch.as_tensor(np.asarray(a), dtype=self.dtype, device=self.device)  # noqa: E731
+        self.X = T(X_ref)
+        self.Dm_inv = T(np.linalg.inv(Dm))
+        self.vol = T(det / 6.0)
+        self.total_volume = float(self.vol.sum())
+        bf = self.mesh.boundary_faces
+        fn = np.cross(X_ref[bf[:, 1]] - X_ref[bf[:, 0]], X_ref[bf[:, 2]] - X_ref[bf[:, 0]]) * 0.5
+        surf_n = np.zeros_like(X_ref)
+        for k in range(3):
+            np.add.at(surf_n, bf[:, k], fn)
+        self.epi_area_n = T(surf_n[self.epi.cpu().numpy()])
+        zero = torch.zeros_like(self.X)
+        self.V0s = [abs(float(self.cavity_volume(zero, k))) for k in range(self.n_cavities)]
+        self.V0 = self.V0s[0]
+        self.offset = X_ref - self.mesh.points
+
+    @property
+    def n_cavities(self):
+        return len(self._faces)
+
+    @property
+    def biventricular(self):
+        return self.n_cavities > 1
 
     # ------------------------------------------------------------------
     def active_tension(self, t_ms, scale=1.0):
@@ -180,12 +231,12 @@ class MechanicsModel:
         psi_act = 0.5 * Ta * ((I4f - 1) + eta * ((I4s - 1) + (I4n - 1)))
         return ((psi + psi_act) * self.vol).sum()
 
-    def cavity_volume(self, u):
+    def cavity_volume(self, u, k=0):
         x = self.X + u
-        c = x[self.rim].mean(0)
-        f = self.endo_faces
+        c = x[self._rims[k]].mean(0)
+        f = self._faces[k]
         a, b, d = x[f[:, 0]] - c, x[f[:, 1]] - c, x[f[:, 2]] - c
-        return -self.cavity_sign * (a * torch.cross(b, d, dim=1)).sum() / 6.0
+        return -self._signs[k] * (a * torch.cross(b, d, dim=1)).sum() / 6.0
 
     def bc_energy(self, u):
         cfg = self.cfg
@@ -197,19 +248,30 @@ class MechanicsModel:
         e = e + 0.5 * cfg.k_pericardium * (torch.relu(un) ** 2).sum() / max(self.mesh.spacing, 1e-9) ** 2
         return e
 
-    def total_energy(self, u, Ta, mode, p_pa=0.0, alpha=0.0, v_star=0.0):
+    def _loads(self, mode, p_pa, alpha, v_star, loads):
+        """Per-cavity loads ``(mode, p_pa, alpha, v_star)``; unspecified cavities are unloaded."""
+        if loads is None:
+            loads = [(mode, p_pa, alpha, v_star)]
+        loads = list(loads) + [("pressure", 0.0, 0.0, 0.0)] * (self.n_cavities - len(loads))
+        return loads[: self.n_cavities]
+
+    def total_energy(self, u, Ta, mode="pressure", p_pa=0.0, alpha=0.0, v_star=0.0, loads=None):
         W = self.strain_energy(u, Ta) + self.bc_energy(u)
-        V = self.cavity_volume(u)
-        if mode == "pressure":
-            W = W - p_pa * V
-        else:
-            W = W + 0.5 * alpha * (v_star - V) ** 2
-        return W, V
+        Vs = []
+        for k, (md, p, a, vs) in enumerate(self._loads(mode, p_pa, alpha, v_star, loads)):
+            V = self.cavity_volume(u, k)
+            W = W - p * V if md == "pressure" else W + 0.5 * a * (vs - V) ** 2
+            Vs.append(V)
+        return W, Vs[0] if loads is None else Vs
 
     # ------------------------------------------------------------------
-    def solve(self, u0, Ta, mode="pressure", p_pa=0.0, alpha=0.0, v_star=0.0, max_iter=None):
-        """Static equilibrium; returns (u, cavity volume mm^3, cavity pressure Pa, info)."""
+    def solve(self, u0, Ta, mode="pressure", p_pa=0.0, alpha=0.0, v_star=0.0, max_iter=None, loads=None):
+        """Static equilibrium; returns (u, LV volume mm^3, LV pressure Pa, info).
+
+        ``loads``: one ``(mode, p_pa, alpha, v_star)`` per cavity (LV, RV); ``info["volumes"]`` and
+        ``info["pressures"]`` then hold every cavity's volume (mm^3) and pressure (Pa)."""
         cfg = self.cfg
+        loads = self._loads(mode, p_pa, alpha, v_star, loads)
         u = torch.as_tensor(u0, dtype=self.dtype, device=self.device).clone().requires_grad_(True)
         Ta_t = torch.as_tensor(Ta, dtype=self.dtype, device=self.device)
         scale = 1.0 / (cfg.material.a_iso * self.total_volume)
@@ -220,24 +282,25 @@ class MechanicsModel:
 
         def closure():
             opt.zero_grad()
-            W, V = self.total_energy(u, Ta_t, mode, p_pa, alpha, v_star)
+            W, _ = self.total_energy(u, Ta_t, loads=loads)
             loss = W * scale
             loss.backward()
-            state["V"] = float(V.detach())
             state["W"] = float(W.detach())
             return loss
 
         opt.step(closure)
         with torch.no_grad():
-            V = float(self.cavity_volume(u))
-            p = p_pa if mode == "pressure" else alpha * (v_star - V)
+            Vs = [float(self.cavity_volume(u, k)) for k in range(self.n_cavities)]
+            ps = [p if md == "pressure" else a * (vs - V) for (md, p, a, vs), V in zip(loads, Vs)]
             g = u.grad.abs().max().item() if u.grad is not None else 0.0
         n_iter = opt.state[opt._params[0]].get("n_iter", 0)
-        return u.detach().cpu().numpy(), V, p, {"iterations": n_iter, "grad_inf": g, "energy": state.get("W", 0.0)}
+        return u.detach().cpu().numpy(), Vs[0], ps[0], {"iterations": n_iter, "grad_inf": g,
+                                                         "energy": state.get("W", 0.0), "volumes": Vs, "pressures": ps}
 
     # ------------------------------------------------------------------
     def potential_batch(self, U, Ta, p_pa):
-        """Pressure-loaded total potential for a batch: U (B,N,3), Ta (B,E), p (B,) -> (B,), V (B,)."""
+        """Pressure-loaded total potential for a batch: U (B,N,3), Ta (B,E), p (B,) LV or (B,K) per cavity
+        -> Pi (B,), V (B,) LV or (B,K)."""
         m = self.cfg.material
         x = self.X[None] + U
         xt = x[:, self.tets]  # (B,E,4,3)
@@ -266,15 +329,18 @@ class MechanicsModel:
         W = W + 0.5 * cfg.k_base_axial * (ax**2).sum(1) + 0.5 * cfg.k_base_plane * (plane**2).sum((1, 2))
         un = (U[:, self.epi] * self.epi_area_n[None]).sum(2)
         W = W + 0.5 * cfg.k_pericardium * (relu(un) ** 2).sum(1) / max(self.mesh.spacing, 1e-9) ** 2
-        V = self.cavity_volume_batch(U)
-        return W - p_pa * V, V
+        if p_pa.dim() == 1:
+            V = self.cavity_volume_batch(U)
+            return W - p_pa * V, V
+        V = torch.stack([self.cavity_volume_batch(U, k) for k in range(p_pa.shape[1])], 1)
+        return W - (p_pa * V).sum(1), V
 
-    def cavity_volume_batch(self, U):
+    def cavity_volume_batch(self, U, k=0):
         x = self.X[None] + U
-        c = x[:, self.rim].mean(1, keepdim=True)
-        f = self.endo_faces
+        c = x[:, self._rims[k]].mean(1, keepdim=True)
+        f = self._faces[k]
         a, b, d = x[:, f[:, 0]] - c, x[:, f[:, 1]] - c, x[:, f[:, 2]] - c
-        return -self.cavity_sign * (a * torch.cross(b, d, dim=2)).sum((1, 2)) / 6.0
+        return -self._signs[k] * (a * torch.cross(b, d, dim=2)).sum((1, 2)) / 6.0
 
     def element_fields(self, u, Ta):
         """Fibre stretch, fibre Cauchy stress (kPa), J and Green-Lagrange fibre strain per element."""

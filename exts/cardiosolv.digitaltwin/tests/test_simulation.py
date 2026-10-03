@@ -14,7 +14,9 @@ torch = pytest.importorskip("torch")
 def test_mesh_conforms_to_user_surface(heart_pipeline):
     md = heart_pipeline.mesh.metadata
     assert md["unlabelled_faces"] == 0
-    assert abs(md["volume_ml"] - heart_pipeline.geometry.metrics["myocardial_volume_ml"]) < 6
+    gm = heart_pipeline.geometry.metrics
+    # biventricular by default: the mesh holds the LV wall + septum and the RV free wall
+    assert abs(md["volume_ml"] - gm["myocardial_volume_ml"] - gm.get("rv_wall_volume_ml", 0.0)) < 8
     assert md["snap_mean_distance_mm"] < 1.0
     assert (heart_pipeline.mesh.tet_volumes() > 0).all()
 

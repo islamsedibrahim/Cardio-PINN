@@ -234,6 +234,12 @@ class CardioSolvPanel:
                         ui.Label(label, width=220)
                         cb = ui.CheckBox()
                         cb.model.add_value_changed_fn(lambda m, k=key: self._set_cfg(k, m.as_bool))
+                with ui.HStack(height=22):
+                    ui.Label("Biventricular (RV wall + RV cavity)", width=220)
+                    cb = ui.CheckBox()
+                    cb.model.set_value(self.cfg.biventricular)
+                    cb.model.add_value_changed_fn(lambda m: self._set_cfg("biventricular", m.as_bool))
+                self._float_field("Derived RV wall thickness (mm)", self.cfg.rv_wall_mm, "rv_wall_mm")
                 ui.Button("Build Geometry Layer", height=26, clicked_fn=lambda: self._spawn(self._run_stage("geometry")))
                 self._status_row("geometry")
                 self._labels["geometry_info"] = ui.Label("", word_wrap=True, height=0)
@@ -275,6 +281,26 @@ class CardioSolvPanel:
                 self._float_field("End-diastolic pressure (mmHg)", self.cfg.edp_mmhg, "edp_mmhg")
                 self._float_field("Peripheral resistance (mmHg s/mL)", self.cfg.r_periph, "r_periph")
                 self._float_field("Arterial compliance (mL/mmHg)", self.cfg.c_art, "c_art")
+                ui.Label("Diastole / passive personalisation", height=18)
+                states = ["auto", "unloaded", "end_diastolic"]
+                with ui.HStack(height=22):
+                    ui.Label("Imaged geometry is", width=220)
+                    c = ui.ComboBox(0, *states)
+                    c.model.add_item_changed_fn(lambda m, _: self._set_cfg("geometry_state", states[_combo_value(m)]))
+                calib = ["auto", "off", "klotz", "measured"]
+                with ui.HStack(height=22):
+                    ui.Label("Passive stiffness fit", width=220)
+                    c = ui.ComboBox(0, *calib)
+                    c.model.add_item_changed_fn(lambda m, _: self._set_cfg("passive_calibration", calib[_combo_value(m)]))
+                with ui.HStack(height=22):
+                    ui.Label("Measured LVEDV (mL, 0 = none)", width=220)
+                    f = ui.FloatField(width=90)
+                    f.model.add_value_changed_fn(lambda m: self._set_cfg("measured_edv_ml", m.as_float or None))
+                ui.Label("Right heart (biventricular twins)", height=18)
+                self._float_field("RV end-diastolic pressure (mmHg)", self.cfg.rv_edp_mmhg, "rv_edp_mmhg")
+                self._float_field("Pulmonary resistance (mmHg s/mL)", self.cfg.pvr, "pvr")
+                self._float_field("Pulmonary compliance (mL/mmHg)", self.cfg.c_pulmonary, "c_pulmonary")
+                self._float_field("PA diastolic pressure (mmHg)", self.cfg.p_pulmonary_diastolic, "p_pulmonary_diastolic")
                 self._float_field("Cycle length (ms)", self.cfg.cycle_ms, "cycle_ms")
                 self._float_field("Time step (ms)", self.cfg.mechanics_dt_ms, "mechanics_dt_ms")
                 ui.Button("Simulate Heartbeat", height=26, clicked_fn=lambda: self._spawn(self._run_stage("mechanics")))
@@ -459,7 +485,9 @@ class CardioSolvPanel:
         r = simulate_cycle_surrogate(p.surrogate, p._circulation(), scale)
         m = r["metrics"]
         self._labels["whatif"].text = (f"x{scale:.2f}: EF {m['ejection_fraction_pct']:.1f} %, SV "
-                                       f"{m['stroke_volume_ml']:.1f} mL, LVP {m['peak_lv_pressure_mmhg']:.0f} mmHg")
+                                       f"{m['stroke_volume_ml']:.1f} mL, LVP {m['peak_lv_pressure_mmhg']:.0f} mmHg"
+                                       + (f" | RVEF {m['rv_ejection_fraction_pct']:.1f} %, RVP "
+                                          f"{m['peak_rv_pressure_mmhg']:.0f} mmHg" if "rv_edv_ml" in m else ""))
 
     # ------------------------------------------------------------ displays
     def _show_parts(self):
@@ -501,6 +529,8 @@ class CardioSolvPanel:
         self._labels["geometry_info"].text = (
             f"Myocardium: {m['myocardial_volume_ml']:.1f} mL ({g.myocardium_source}), mass {m['myocardial_mass_g']:.0f} g\n"
             f"LV cavity: {m['lv_cavity_volume_ml']:.1f} mL, wall {m['mean_wall_thickness_mm']:.1f} mm\n"
+            + (f"RV free wall: {m['rv_wall_volume_ml']:.1f} mL, RV cavity {m['rv_cavity_volume_ml']:.1f} mL "
+               f"(biventricular)\n" if g.biventricular else "") +
             f"Long axis: {m['long_axis_length_mm']:.1f} mm, confidence {g.long_axis.confidence:.2f} "
             f"({', '.join(f'{x.name}:{x.sign:+.0f}' for x in g.long_axis.votes)})\n"
             f"Surfaces: {g.to_dict()['surface_label_counts']}\nValidation: {v['status']}"
@@ -509,14 +539,19 @@ class CardioSolvPanel:
     def _show_mesh(self):
         md = self.pipe.mesh.metadata
         self._labels["mesh_info"].text = (f"{md['nodes']} nodes, {md['tets']} tets, {md['volume_ml']:.1f} mL; "
-                                          f"snap to your surface {md.get('snap_mean_distance_mm', 0):.2f} mm")
+                                          f"snap to your surface {md.get('snap_mean_distance_mm', 0):.2f} mm"
+                                          + (f"; RV free wall {md['rv_wall_volume_ml']:.1f} mL"
+                                             if md.get("biventricular") else ""))
 
     def _show_ep(self):
         ep = self.pipe.ep
         m = ep.metrics
         self._labels["ep_info"].text = (f"QRS {m['qrs_duration_ms']:.0f} ms | total activation "
                                         f"{m['total_activation_time_ms']:.0f} ms | septal->lateral "
-                                        f"{m['septal_to_lateral_delay_ms']:.0f} ms | APD {m['mean_apd_ms']:.0f} ms")
+                                        f"{m['septal_to_lateral_delay_ms']:.0f} ms | APD {m['mean_apd_ms']:.0f} ms"
+                                        + (f"\nRV activated by {m['rv_total_activation_ms']:.0f} ms | LV-RV free-wall "
+                                           f"delay {m['interventricular_delay_ms']:.0f} ms"
+                                           if "rv_total_activation_ms" in m else ""))
         if ep.ecg:
             with self._plots_frame["ep"]:
                 with ui.VStack(height=0):
@@ -532,7 +567,17 @@ class CardioSolvPanel:
             f"EDV {m['edv_ml']:.1f} mL | ESV {m['esv_ml']:.1f} mL | SV {m['stroke_volume_ml']:.1f} mL | "
             f"EF {m['ejection_fraction_pct']:.1f} %\nLVP max {m['peak_lv_pressure_mmhg']:.0f} mmHg | aortic "
             f"{m['peak_aortic_pressure_mmhg']:.0f}/{m['min_aortic_pressure_mmhg']:.0f} mmHg | fibre strain "
-            f"{100 * m['peak_mean_fiber_strain']:.1f} %")
+            f"{100 * m['peak_mean_fiber_strain']:.1f} %"
+            + (f"\nRVEDV {m['rv_edv_ml']:.1f} mL | RVESV {m['rv_esv_ml']:.1f} mL | RVEF "
+               f"{m['rv_ejection_fraction_pct']:.1f} % | RVP max {m['peak_rv_pressure_mmhg']:.0f} mmHg | PA "
+               f"{m['pa_systolic_mmhg']:.0f}/{m['pa_diastolic_mmhg']:.0f} mmHg" if "rv_edv_ml" in m else ""))
+        ps = getattr(self.pipe, "passive", None)
+        if ps:
+            d = ps["diastolic"]
+            self._labels["mechanics_info"].text += (
+                f"\nPassive ({ps['mode']}): stiffness x{ps['stiff_scale']:.2f}, unloaded LV {d['model_v0_ml']:.1f} mL "
+                f"(Klotz {d['klotz_v0_ml']:.1f}), V30 {d['model_v30_ml']:.0f} mL, ED stiffness "
+                f"{d['ed_chamber_stiffness_mmhg_per_ml']:.2f} mmHg/mL")
         with self._plots_frame["mechanics"]:
             with ui.VStack(height=0):
                 ui.Label("LV pressure (mmHg) over the beat", height=16)
@@ -541,6 +586,11 @@ class CardioSolvPanel:
                 ui.Label("LV volume (mL) over the beat", height=16)
                 ui.Plot(ui.Type.LINE, float(c.volume_ml.min()), float(c.volume_ml.max()),
                         *c.volume_ml.astype(float).tolist(), height=70, style={"color": 0xFFFFAA44})
+                if "RV" in c.chambers:
+                    rv = c.chambers["RV"]
+                    ui.Label("RV pressure (mmHg) over the beat", height=16)
+                    ui.Plot(ui.Type.LINE, 0.0, float(rv["pressure_mmhg"].max()),
+                            *rv["pressure_mmhg"].astype(float).tolist(), height=60, style={"color": 0xFFFF7755})
 
     def _show_surrogate(self):
         p = self.pipe

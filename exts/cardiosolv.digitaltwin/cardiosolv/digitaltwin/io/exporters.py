@@ -49,8 +49,10 @@ def export_vtk_series(folder, mesh, coords, ep, cycle, every=1):
     if ep is not None:
         static["activation_time"] = ep.activation_time
         static["apd"] = ep.apd
-    paths.append(write_vtk(os.path.join(folder, "anatomy.vtk"), mesh.points, mesh.tets, static,
-                           {"fiber": coords.fiber, "sheet": coords.sheet}))
+    cell = {"fiber": coords.fiber, "sheet": coords.sheet}
+    if mesh.tet_region is not None:
+        cell["region"] = mesh.tet_region.astype(float)  # 0 LV wall + septum, 1 RV free wall
+    paths.append(write_vtk(os.path.join(folder, "anatomy.vtk"), mesh.points, mesh.tets, static, cell))
     if cycle is not None:
         for k in range(0, cycle.frame_count(), every):
             t = float(cycle.times[k])
@@ -73,7 +75,10 @@ def export_opencarp(folder, mesh, coords, ep=None, name="cardiosolv"):
     with open(base + ".pts", "w") as f:
         f.write(f"{len(pts_um)}\n")
         np.savetxt(f, pts_um, fmt="%.3f")
+    # endo / mid / epi layers (1-3) of the LV wall + septum; the RV free wall adds 10 to its layer tag
     tags = np.where(coords.x_t[mesh.tets].mean(1) < 0.33, 1, np.where(coords.x_t[mesh.tets].mean(1) < 0.66, 2, 3))
+    if mesh.tet_region is not None:
+        tags = tags + 10 * mesh.tet_region
     with open(base + ".elem", "w") as f:
         f.write(f"{len(mesh.tets)}\n")
         for t, tag in zip(mesh.tets, tags):

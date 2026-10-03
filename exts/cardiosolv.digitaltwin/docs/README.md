@@ -116,6 +116,31 @@ Flip the apex/base or LV/RV sides from the panel if the asset is unusual.
 **Auto-scale**: assets outside 60–200 mm (the example heart is 1.1 m tall at `metersPerUnit = 1`)
 are simulated in an anatomical frame (heart length 120 mm) and mapped back at the displayed size.
 
+## Biventricular twin
+
+By default (`biventricular = True`) the twin simulates both ventricles:
+
+* **RV free wall**: taken from an RV myocardium part when the heart has one, otherwise derived as a
+  `rv_wall_mm` (3.5 mm) shell around your RV blood pool, kept only where it is connected to the LV wall
+  (flagged in the geometry warnings). Skin mode uses its assumed 4 mm RV wall.
+* **Mesh**: one conforming tet mesh, region 0 = LV wall + septum, region 1 = RV free wall; RV
+  endocardium = the `RVSeptum` surface class (septal + free-wall RV side). Your LV myocardium
+  surface is snapped as before, the derived RV wall is smoothed.
+* **Fibres**: two transmural fields (LV endo 0 -> epi / RV endo 1 for the LV and septum, RV endo 0 ->
+  epi 1 for the RV free wall), each with its own helix rotation.
+* **EP**: separate LV and RV Purkinje layers. Sinus uses both; LBBB keeps the right bundle (RV
+  activated early, LV free wall late); RV pacing and CRT conduct retrogradely through the right bundle.
+  Reports `rv_total_activation_ms` and `interventricular_delay_ms`.
+* **Mechanics**: one energy with an LV and an RV cavity term, so the septum is loaded by both
+  pressures (ventricular interdependence comes out of the mechanics). Each ventricle has its own valve
+  state machine; the LV ejects into the systemic and the RV into a pulmonary 3-element Windkessel
+  (`pvr`, `c_pulmonary`, `p_pulmonary_diastolic`, `rv_edp_mmhg`).
+* **Surrogate**: inputs `(p_LV, p_RV, t, s)`; the surrogate beat solves both ventricles by Gauss–Seidel.
+* **Outputs**: RVEDV/RVESV/RVEF, RV peak pressure, PA systolic/diastolic, RV/LV EDV ratio, RV PV loop
+  in the report and the dashboard; the RV parts of your heart are painted too.
+
+Set `biventricular = False` (panel: *Biventricular*) for the LV-only twin of earlier versions.
+
 ## Physics
 
 | Stage | Model | Notes |
@@ -159,8 +184,10 @@ python -m pytest
 
 ## Limitations (research prototype — not for clinical use)
 
-* LV only (the RV wall is not simulated); quasi-static mechanics; lumped (0D) haemodynamics
-  instead of 3D FSI.
+* Quasi-static mechanics; lumped (0D) haemodynamics instead of 3D FSI; atria are not simulated
+  (prescribed filling pressures), so a single beat need not balance LV and RV stroke volumes.
+* A derived RV wall is a uniform 3.5 mm shell; at 3–4 mm elements it is one or two elements thick, so
+  RV wall stresses are coarse. Use an RV myocardium segmentation and smaller elements for RV studies.
 * P1 tetrahedra with a penalty volumetric term; refine elements for stress quantities.
 * Monodomain conduction velocity needs ≤ 1 mm elements to converge; the eikonal solver is the
   interactive default.

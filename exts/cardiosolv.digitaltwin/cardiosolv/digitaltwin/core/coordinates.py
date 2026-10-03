@@ -6,11 +6,16 @@ Coordinates follow the Cardio-PINN parametrisation (Buoso et al. 2021):
 local directions ``e_t, e_l, e_c``. Fibres use Cardio-PINN's
 ``GenerateFibers`` rule (helix angle linear from endo to epi, sheet angle
 gamma), vectorised.
+
+Biventricular meshes use two transmural solves (Bayer et al. 2012 style):
+LV endo 0 -> epi / RV endo 1 for the LV wall and septum, and RV endo 0 -> epi 1
+for the RV free wall, each with its own gradient and fibre field.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import scipy.sparse as sp
@@ -75,6 +80,9 @@ class VentricularCoordinates:
     normal: np.ndarray  # n0
     fiber_nodes: np.ndarray  # nodal fibres (N,3) for visualisation / openCARP
     params: dict = field(default_factory=dict)
+    node_region: Optional[np.ndarray] = None  # (N,) 0 LV / septum, 1 RV free wall (biventricular meshes)
+    x_t_lv: Optional[np.ndarray] = None  # whole-mesh LV endo (0) -> epi / RV endo (1) field
+    x_t_rv: Optional[np.ndarray] = None  # whole-mesh RV endo (0) -> epi (1) field
 
 
 def generate_fibers(e_t, e_l, e_c, x_t, endo_angle=60.0, epi_angle=-60.0, gamma_angle=-65.0):
@@ -99,8 +107,23 @@ def compute_coordinates(mesh: TetMesh, gl: GeometryLayer, endo_angle=60.0, epi_a
     if len(endo) == 0 or len(epi) == 0:
         raise RuntimeError("Endocardial or epicardial boundary missing on the computational mesh.")
     K = stiffness_matrix(mesh.points, mesh.tets)
-    x_t = solve_laplace(K, n, np.concatenate([endo, epi]), np.concatenate([np.zeros(len(endo)), np.ones(len(epi))]))
-    x_t = np.clip(x_t, 0, 1)
+    biv = mesh.biventricular and len(sets.get("rv_endo", ())) > 0
+    if biv:
+        rv_endo = np.setdiff1d(sets["rv_endo"], endo)
+        epi = np.setdiff1d(epi, rv_endo)
+        out = np.concatenate([epi, rv_endo])
+        x_lv = solve_laplace(K, n, np.concatenate([endo, out]), np.concatenate([np.zeros(len(endo)), np.ones(len(out))]))
+        x_rv = solve_laplace(K, n, np.concatenate([rv_endo, epi]),
+                             np.concatenate([np.zeros(len(rv_endo)), np.ones(len(epi))]))
+        node_region = mesh.node_region()
+        tet_region = mesh.tet_region
+        x_t = np.clip(np.where(node_region == 1, x_rv, x_lv), 0, 1)
+        fields = [(np.clip(x_lv, 0, 1), tet_region == 0), (np.clip(x_rv, 0, 1), tet_region == 1)]
+    else:
+        x_t = np.clip(solve_laplace(K, n, np.concatenate([endo, epi]),
+                                    np.concatenate([np.zeros(len(endo)), np.ones(len(epi))])), 0, 1)
+        node_region = x_lv = x_rv = None
+        fields = [(x_t, np.ones(mesh.n_tets, bool))]
 
     ax = gl.long_axis
     d = ax.direction
@@ -112,18 +135,23 @@ def compute_coordinates(mesh: TetMesh, gl: GeometryLayer, endo_angle=60.0, epi_a
     x_c = (ang / (2 * np.pi)) % 1.0
 
     G, vol = shape_gradients(mesh.points, mesh.tets)
-    grad_t = np.einsum("ei,eid->ed", x_t[mesh.tets], G)
-    # smooth element gradients through the nodes (robust near the apex / base rim)
-    node_g = np.zeros((n, 3))
-    np.add.at(node_g, mesh.tets.ravel(), np.repeat(grad_t * vol[:, None], 4, axis=0))
-    e_t = normalize(node_g[mesh.tets].mean(1))
-    degenerate = np.linalg.norm(node_g[mesh.tets].mean(1), axis=1) < 1e-12
+    # smooth element gradients through the nodes (robust near the apex / base rim), per ventricle
+    g_el = np.zeros((mesh.n_tets, 3))
+    xt_el = np.zeros(mesh.n_tets)
+    for xf, sel in fields:
+        t = mesh.tets[sel]
+        grad_t = np.einsum("ei,eid->ed", xf[t], G[sel])
+        node_g = np.zeros((n, 3))
+        np.add.at(node_g, t.ravel(), np.repeat(grad_t * vol[sel][:, None], 4, axis=0))
+        g_el[sel] = node_g[t].mean(1)
+        xt_el[sel] = xf[t].mean(1)
+    e_t = normalize(g_el)
+    degenerate = np.linalg.norm(g_el, axis=1) < 1e-12
     centroid = mesh.points[mesh.tets].mean(1)
     radial = centroid - ax.apex - np.outer((centroid - ax.apex) @ d, d)
     e_t[degenerate] = normalize(radial[degenerate])
     e_l = normalize(d[None, :] - (e_t @ d)[:, None] * e_t)
     e_c = normalize(np.cross(e_l, e_t))
-    xt_el = x_t[mesh.tets].mean(1)
     f, s, nn = generate_fibers(e_t, e_l, e_c, xt_el, endo_angle, epi_angle, gamma_angle)
 
     fn = np.zeros((n, 3))
@@ -134,4 +162,7 @@ def compute_coordinates(mesh: TetMesh, gl: GeometryLayer, endo_angle=60.0, epi_a
     return VentricularCoordinates(x_t=x_t, x_l=x_l, x_c=x_c, e_t=e_t, e_l=e_l, e_c=e_c, fiber=f, sheet=s,
                                   normal=nn, fiber_nodes=fn,
                                   params={"endo_helix_deg": endo_angle, "epi_helix_deg": epi_angle,
-                                          "sheet_gamma_deg": gamma_angle})
+                                          "sheet_gamma_deg": gamma_angle, "biventricular": bool(biv)},
+                                  node_region=node_region,
+                                  x_t_lv=None if x_lv is None else np.clip(x_lv, 0, 1),
+                                  x_t_rv=None if x_rv is None else np.clip(x_rv, 0, 1))

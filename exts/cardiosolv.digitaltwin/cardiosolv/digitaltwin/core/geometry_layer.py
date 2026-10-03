@@ -9,7 +9,8 @@ Surface classes (shared by every later stage):
     1 ENDO        LV endocardium (faces the LV blood pool)
     2 EPI         epicardium
     3 BASE        basal / valve plane
-    4 RV_SEPTUM   epicardial side of the septum facing the RV blood pool
+    4 RV_SEPTUM   surface facing the RV blood pool: the septum's RV side in LV-only
+                  meshes, the whole RV endocardium (septal + free wall) in biventricular ones
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ UNKNOWN, ENDO, EPI, BASE, RV_SEPTUM = 0, 1, 2, 3, 4
 SURFACE_NAMES = {ENDO: "Endocardium", EPI: "Epicardium", BASE: "Base", RV_SEPTUM: "RVSeptum"}
 
 # voxel classes
-V_OUT, V_MYO, V_LVC, V_RVC, V_BASE_STRUCT, V_OTHER = 0, 1, 2, 3, 4, 5
+V_OUT, V_MYO, V_LVC, V_RVC, V_BASE_STRUCT, V_OTHER, V_RV_MYO = 0, 1, 2, 3, 4, 5, 6
+WALL_CLASSES = (V_MYO, V_RV_MYO)
 
 
 @dataclass
@@ -58,6 +60,7 @@ class GeometryLayer:
     metrics: Dict[str, float] = field(default_factory=dict)
     confidence: Dict[str, float] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    biventricular: bool = False  # RV free wall (V_RV_MYO) is part of the simulated wall
     skin: Optional[dict] = None  # skin-mode details (assumed anatomy)
 
     @property
@@ -68,6 +71,7 @@ class GeometryLayer:
         return {
             "grid": {"origin": self.grid.origin.tolist(), "spacing": self.grid.spacing, "shape": list(self.grid.shape)},
             "myocardium_source": self.myocardium_source,
+            "biventricular": self.biventricular,
             "long_axis": self.long_axis.to_dict(),
             "septum_direction": self.septum_direction.tolist(),
             "septum_confidence": self.septum_confidence,
@@ -95,7 +99,7 @@ def _centers(grid, mask):
 
 
 def label_surface_faces(mesh: SurfaceMesh, grid: VoxelGrid, vclass: np.ndarray, axis: LongAxis,
-                        smooth_iterations=3) -> np.ndarray:
+                        smooth_iterations=3, wall_classes=(V_MYO,)) -> np.ndarray:
     """Classify each triangle of the user's myocardium surface.
 
     The tissue on the outward side of each face decides its class: LV blood
@@ -111,7 +115,8 @@ def label_surface_faces(mesh: SurfaceMesh, grid: VoxelGrid, vclass: np.ndarray, 
     cls_p = grid.sample(vclass, plus, fill=V_OUT)
     cls_m = grid.sample(vclass, minus, fill=V_OUT)
     # outward side = the side that is not myocardium (robust to flipped normals)
-    use_minus = (cls_p == V_MYO) & (cls_m != V_MYO)
+    wall = list(wall_classes)
+    use_minus = np.isin(cls_p, wall) & ~np.isin(cls_m, wall)
     outward_n = np.where(use_minus[:, None], -n, n)
     # probe outward up to ~3.5 mm: segmentation parts often leave thin gaps
     # between the wall and the neighbouring blood pools
@@ -119,7 +124,7 @@ def label_surface_faces(mesh: SurfaceMesh, grid: VoxelGrid, vclass: np.ndarray, 
     pending = np.ones(mesh.n_faces, bool)
     for dist in (off, 1.5 * h, max(2.5 * h, 2.0), max(3.5 * h, 3.5)):
         cls = grid.sample(vclass, c[pending] + outward_n[pending] * dist, fill=V_OUT)
-        hit = (cls != V_OUT) & (cls != V_MYO)
+        hit = (cls != V_OUT) & ~np.isin(cls, wall)
         idx = np.nonzero(pending)[0]
         outward_cls[idx[hit]] = cls[hit]
         pending[idx[hit]] = False
@@ -128,7 +133,7 @@ def label_surface_faces(mesh: SurfaceMesh, grid: VoxelGrid, vclass: np.ndarray, 
     labels[outward_cls == V_LVC] = ENDO
     labels[outward_cls == V_RVC] = RV_SEPTUM
     labels[outward_cls == V_BASE_STRUCT] = BASE
-    labels[(outward_cls == V_OUT) | (outward_cls == V_OTHER)] = EPI
+    labels[np.isin(outward_cls, (V_OUT, V_OTHER, V_RV_MYO, V_MYO))] = EPI
 
     # flat basal cut: normal along +axis near the top of the ventricle
     xl = axis.project(c)
@@ -152,8 +157,17 @@ def label_surface_faces(mesh: SurfaceMesh, grid: VoxelGrid, vclass: np.ndarray, 
     return labels
 
 
+def derive_rv_wall(rv_occ, myo, lvc, exclude, spacing, rv_wall_mm=3.5, epi_occ=None):
+    """RV free wall as a shell around the RV blood pool (RV myocardium is rarely segmented)."""
+    rv_myo = dilate_mm(rv_occ, rv_wall_mm, spacing) & ~rv_occ & ~myo & ~lvc & ~exclude
+    if epi_occ is not None and epi_occ.any():
+        rv_myo &= epi_occ
+    return rv_myo
+
+
 def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spacing: Optional[float] = None,
-                         wall_thickness_mm: float = 10.0) -> GeometryLayer:
+                         wall_thickness_mm: float = 10.0, biventricular: bool = True,
+                         rv_wall_mm: float = 3.5) -> GeometryLayer:
     warnings: List[str] = []
     role = asg.part
     myo_i, lv_i, rv_i = role(A.MYOCARDIUM), role(A.LV), role(A.RV)
@@ -175,7 +189,9 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
 
     lv_occ, rv_occ = occ(A.LV), occ(A.RV)
     base_occ = occ(A.LA) | occ(A.AORTA) | occ(A.PA)
-    other_occ = occ(A.RA) | occ(A.RV_MYOCARDIUM)
+    ra_occ = occ(A.RA)
+    rvm_occ = occ(A.RV_MYOCARDIUM)
+    other_occ = ra_occ | (rvm_occ if not biventricular else np.zeros_like(ra_occ))
     epi_occ = occ(A.EPICARDIUM)
 
     # ---------------- myocardium ----------------
@@ -219,8 +235,22 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
         myo[tuple(cut.T)] = False
         myo = largest_component(myo)
 
+    # ---------------- RV free wall (biventricular) ----------------
+    rv_myo = None
+    if biventricular and rv_occ.any():
+        if rvm_occ.any():
+            rv_myo = rvm_occ & ~myo & ~lvc & ~rv_occ
+        else:
+            rv_myo = derive_rv_wall(rv_occ, myo, lvc, base_occ | ra_occ, spacing, rv_wall_mm, epi_occ)
+            warnings.append(f"RV free wall derived as a {rv_wall_mm:.1f} mm shell around the RV blood pool.")
+        both = largest_component(myo | rv_myo)
+        rv_myo &= both
+        if rv_myo.sum() < 50:
+            warnings.append("RV free wall could not be attached to the LV: simulating the LV only.")
+            rv_myo = None
+
     return finalize_geometry_layer(
-        grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ, source=source, cav_method=cav_method,
+        grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ, source=source, cav_method=cav_method, rv_myo=rv_myo,
         myo_surface=parts[myo_i] if myo_i is not None else None, myo_part=myo_i,
         myo_score=asg.scores.get(A.MYOCARDIUM, 0.45 if source == "derived" else 0.0),
         named_base={name: occ(r) for name, r in (("MitralAnnulus", A.LA), ("AorticAnnulus", A.AORTA))
@@ -230,7 +260,7 @@ def build_geometry_layer(parts: List[SurfaceMesh], asg: A.AnatomyAssignment, spa
 
 def finalize_geometry_layer(grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ, *, source, cav_method,
                             myo_surface=None, myo_part=None, myo_score=0.0, named_base=None,
-                            wall_thickness_mm=10.0, warnings=None) -> GeometryLayer:
+                            wall_thickness_mm=10.0, warnings=None, rv_myo=None) -> GeometryLayer:
     """Common tail of every geometry-layer mode: classes, long axis, septum, labels, landmarks, QC."""
     warnings = list(warnings or [])
     spacing = grid.spacing
@@ -240,6 +270,8 @@ def finalize_geometry_layer(grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ
     vclass[base_occ] = V_BASE_STRUCT
     vclass[rv_occ] = V_RVC
     vclass[lvc] = V_LVC
+    if rv_myo is not None:
+        vclass[rv_myo & ~myo] = V_RV_MYO
     vclass[myo] = V_MYO
 
     # ---------------- long axis ----------------
@@ -306,6 +338,9 @@ def finalize_geometry_layer(grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ
         "lv_cavity_volume_ml": cav_ml,
         "long_axis_length_mm": axis.length_mm,
     }
+    if rv_myo is not None:
+        metrics["rv_wall_volume_ml"] = float((vclass == V_RV_MYO).sum() * h3 / 1000.0)
+        metrics["rv_cavity_volume_ml"] = float((vclass == V_RVC).sum() * h3 / 1000.0)
     if myo_surface is not None:
         a = myo_surface.face_areas()
         lab = surface_labels
@@ -332,4 +367,5 @@ def finalize_geometry_layer(grid, myo, lvc, rv_occ, base_occ, other_occ, epi_occ
     }
     return GeometryLayer(grid=grid, voxel_class=vclass, myocardium_source=source, myocardium_part=myo_part,
                          long_axis=axis, septum_direction=septum_dir, septum_confidence=sep_conf, landmarks=lms,
-                         surface_labels=surface_labels, metrics=metrics, confidence=conf, warnings=warnings)
+                         surface_labels=surface_labels, metrics=metrics, confidence=conf, warnings=warnings,
+                         biventricular=rv_myo is not None)

@@ -55,6 +55,8 @@ class PipelineConfig:
     skin_rv_wall_mm: float = 4.0
     skin_flip_base: bool = False
     skin_flip_lv_side: bool = False
+    biventricular: bool = True  # simulate the RV free wall + RV cavity with a pulmonary circulation
+    rv_wall_mm: float = 3.5  # RV free wall thickness when it has to be derived from the RV blood pool
     geometry_spacing_mm: Optional[float] = None  # auto
     derived_wall_thickness_mm: float = 10.0
     element_size_mm: float = 3.0
@@ -70,6 +72,14 @@ class PipelineConfig:
     r_periph: float = 1.0
     c_art: float = 1.5
     p_aortic_diastolic: float = 80.0
+    rv_edp_mmhg: float = 5.0
+    # passive personalisation: the imaged geometry state and how stiffness is fitted
+    geometry_state: str = "auto"  # "auto" | "unloaded" | "end_diastolic" (auto: Stage 0 imaging -> end_diastolic)
+    passive_calibration: str = "auto"  # "auto" | "off" | "klotz" | "measured"
+    measured_edv_ml: Optional[float] = None  # e.g. echo / MR LVEDV at edp_mmhg
+    pvr: float = 0.14  # mmHg s / mL, pulmonary resistance of the RV Windkessel
+    c_pulmonary: float = 4.0  # mL / mmHg
+    p_pulmonary_diastolic: float = 10.0
     surrogate_epochs: int = 1500
     target_ef_pct: Optional[float] = None  # personalise contractility (e.g. echo LVEF)
     display_field: str = "transmembrane_potential"
@@ -97,6 +107,7 @@ class CardioSolvPipeline:
         self.mesh = self.coords = self.ep = self.mech_model = self.cycle = None
         self.surrogate = self.surrogate_cycle = None
         self.calibration = None
+        self.passive = None
         self.writer = None
         self.skin_part = None
         self.report: dict = {}
@@ -214,11 +225,13 @@ class CardioSolvPipeline:
             self.log(f"    skin-only heart ({skin.source_path}): deriving an ASSUMED ventricular interior")
             prm = SkinModeParams(spacing_mm=self.cfg.geometry_spacing_mm or 1.0, lv_wall_mm=self.cfg.skin_lv_wall_mm,
                                  septum_mm=self.cfg.skin_septum_mm, rv_wall_mm=self.cfg.skin_rv_wall_mm,
-                                 flip_base=self.cfg.skin_flip_base, flip_lv_side=self.cfg.skin_flip_lv_side)
+                                 flip_base=self.cfg.skin_flip_base, flip_lv_side=self.cfg.skin_flip_lv_side,
+                                 biventricular=self.cfg.biventricular)
             self.geometry = build_skin_geometry_layer(skin, self.scan.up_axis, prm)
         else:
             self.geometry = build_geometry_layer(self.scan.parts, self.assignment, self.cfg.geometry_spacing_mm,
-                                                 self.cfg.derived_wall_thickness_mm)
+                                                 self.cfg.derived_wall_thickness_mm, biventricular=self.cfg.biventricular,
+                                                 rv_wall_mm=self.cfg.rv_wall_mm)
         self.canonical = build_canonical(self.source_path, self.scan.parts, self.scan.sources, self.assignment,
                                          self.geometry)
         if self.skin_part is not None:
@@ -313,7 +326,40 @@ class CardioSolvPipeline:
 
         return CirculationParams(r_periph=self.cfg.r_periph, c_art=self.cfg.c_art, edp=self.cfg.edp_mmhg,
                                  p_aortic_diastolic=self.cfg.p_aortic_diastolic, cycle_ms=self.cfg.cycle_ms,
-                                 dt_ms=self.cfg.mechanics_dt_ms)
+                                 dt_ms=self.cfg.mechanics_dt_ms, rv_edp=self.cfg.rv_edp_mmhg,
+                                 rv_r_periph=self.cfg.pvr, rv_c_art=self.cfg.c_pulmonary,
+                                 p_pulmonary_diastolic=self.cfg.p_pulmonary_diastolic)
+
+    def resolved_geometry_state(self) -> str:
+        if self.cfg.geometry_state != "auto":
+            return self.cfg.geometry_state
+        # hearts reconstructed by Stage 0 are end-diastolic images (cine ED phase / CT)
+        prim = self.stage.GetPrimAtPath(self.source_path)
+        while prim and prim.IsValid():
+            if prim.GetCustomDataByKey("cardiosolv:imaging_usd"):
+                return "end_diastolic"
+            prim = prim.GetParent()
+        return "unloaded"
+
+    def run_passive_calibration(self):
+        """Unloaded reference + passive stiffness before the beat (see mechanics/passive.py)."""
+        from .mechanics.passive import calibrate_passive
+
+        state = self.resolved_geometry_state()
+        mode = self.cfg.passive_calibration
+        if mode == "auto":
+            mode = "klotz" if state == "end_diastolic" else ("measured" if self.cfg.measured_edv_ml else "off")
+        self.passive = None
+        if mode == "off":
+            return None
+        self.log(f"    passive calibration: {mode} (geometry {state})")
+        self.passive = calibrate_passive(self.mech_model, self.cfg.edp_mmhg, self.cfg.rv_edp_mmhg, mode,
+                                         self.cfg.measured_edv_ml, log=self.log)
+        self.passive["geometry_state"] = state
+        d = self.passive["diastolic"]
+        self.log(f"    stiffness x{self.passive['stiff_scale']:.2f}; unloaded LV {d['model_v0_ml']:.1f} mL "
+                 f"(Klotz {d['klotz_v0_ml']:.1f}), EDPVR RMS error {d['edpvr_rms_error_ml']:.1f} mL")
+        return self.passive
 
     def run_mechanics(self):
         self._require("ep")
@@ -323,11 +369,16 @@ class CardioSolvPipeline:
             mcfg = MechanicsConfig(t_max_kpa=self.cfg.t_max_kpa, device=self.device)
             self.mech_model = MechanicsModel(self.mesh, self.coords, self.geometry.long_axis, mcfg,
                                              self.ep.activation_time, self.ep.apd)
+            self.run_passive_calibration()
             self.cycle = simulate_cycle(self.mech_model, self._circulation(), log=self.log,
                                         progress=lambda f: self.progress("mechanics", f))
             m = self.cycle.metrics
             self.log(f"    EDV {m['edv_ml']:.1f} mL, ESV {m['esv_ml']:.1f} mL, EF {m['ejection_fraction_pct']:.1f} %, "
                      f"LVP max {m['peak_lv_pressure_mmhg']:.0f} mmHg")
+            if "rv_edv_ml" in m:
+                self.log(f"    RVEDV {m['rv_edv_ml']:.1f} mL, RVESV {m['rv_esv_ml']:.1f} mL, "
+                         f"RVEF {m['rv_ejection_fraction_pct']:.1f} %, RVP max {m['peak_rv_pressure_mmhg']:.0f} mmHg, "
+                         f"PA {m['pa_systolic_mmhg']:.0f}/{m['pa_diastolic_mmhg']:.0f} mmHg")
 
         self.invalidate_after("mechanics")
         return self._timed("mechanics", go)
@@ -406,7 +457,13 @@ class CardioSolvPipeline:
         if self.geometry.myocardium_part is not None:
             myo_prim = self.scan.sources[self.geometry.myocardium_part].prim_path
         if self.writer is None:
-            paint = [self.scan.sources[self.skin_part].prim_path] if getattr(self, "skin_part", None) is not None else None
+            paint = [self.scan.sources[self.skin_part].prim_path] if getattr(self, "skin_part", None) is not None else []
+            rv_i = self.assignment.part(A.RV) if self.assignment else None
+            if self.mesh.biventricular:
+                # the RV wall is simulated: paint the user's RV (blood pool / myocardium) parts too
+                for i in (rv_i, self.assignment.part(A.RV_MYOCARDIUM)):
+                    if i is not None:
+                        paint.append(self.scan.sources[i].prim_path)
             self.writer = TwinResultsWriter(self.stage, self.scan, self.mesh, myo_prim, paint_prims=paint)
         times = self.frame_times()
         codes = self.writer.time_codes(times, self.cfg.slow_motion)
@@ -453,7 +510,9 @@ class CardioSolvPipeline:
     # ------------------------------------------------------------------
     def build_report(self):
         rep = {
-            "cardiosolv_version": "0.4.0",
+            "cardiosolv_version": "0.6.0",
+            "biventricular": bool(self.mech_model is not None and self.mech_model.biventricular)
+            or bool(self.mesh is not None and self.mesh.biventricular),
             "simulation_scale": self.scan.sim_scale if self.scan else 1.0,
             "skin_mode": bool(getattr(self, "skin_part", None) is not None),
             "source_prim": self.source_path,
@@ -477,12 +536,21 @@ class CardioSolvPipeline:
                                                                       "volume_ml": c.volume_ml, "aortic_mmhg": c.aortic_mmhg,
                                                                       "phase": c.phase},
                                    "parameters": c.params}
+            for name, tr in c.chambers.items():
+                rep["hemodynamics"][f"{name.lower()}_pv_loop"] = {
+                    "t_ms": c.times, "pressure_mmhg": tr["pressure_mmhg"], "volume_ml": tr["volume_ml"],
+                    "pulmonary_mmhg" if name == "RV" else "arterial_mmhg": tr["arterial_mmhg"], "phase": tr["phase"]}
+        if getattr(self, "passive", None):
+            rep["diastolic_calibration"] = self.passive
         if self.surrogate_cycle is not None:
             s = self.surrogate_cycle
             rep["surrogate"] = {"backbone": self.surrogate.backbone, "pod_energy": self.surrogate.pod_energy,
                                 "metrics": s["metrics"], "calibration": self.calibration,
                                 "pv_loop": {"t_ms": s["times"], "pressure_mmhg": s["pressure_mmhg"],
                                             "volume_ml": s["volume_ml"]},
+                                **{f"{n.lower()}_pv_loop": {"t_ms": s["times"], "pressure_mmhg": tr["pressure_mmhg"],
+                                                            "volume_ml": tr["volume_ml"]}
+                                   for n, tr in s.get("chambers", {}).items()},
                                 "training_history": self.surrogate.history}
         rep["config"] = _cfg_dict(self.cfg)
         self.report = rep

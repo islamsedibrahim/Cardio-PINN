@@ -16,8 +16,9 @@ derived quantity is flagged ``ASSUMED``:
 4. **Walls** - literature thicknesses: LV free wall 10 mm, septum 10 mm,
    RV free wall 4 mm (Lang et al., JASE 2015 reference ranges).
 
-The simulated domain is the LV wall + septum; the RV free wall and the
-atria/great vessels are carried along visually.
+The simulated domain is the biventricular wall (LV wall, septum and RV free
+wall, ``biventricular=True``) or the LV wall + septum only; the atria and
+great vessels are carried along visually.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ class SkinModeParams:
     av_plane_fraction: Optional[float] = None  # override the detected AV plane (0 apex .. 1 top)
     flip_base: bool = False  # user override if the apex/base sign is wrong
     flip_lv_side: bool = False  # user override if LV/RV sides are swapped
+    biventricular: bool = True  # simulate the RV free wall and RV cavity too
 
 
 def _slab_components(mask, proj, lo, hi):
@@ -163,9 +165,16 @@ def build_skin_geometry_layer(skin: SurfaceMesh, up_axis: str = "Z", params: Ski
     myo = vent & ~lvc & ~rvc & (sd > -prm.septum_mm / 2)
     myo = largest_component(myo)
     rv_free = vent & ~rvc & ~myo & ~lvc
+    rv_myo = None
+    if prm.biventricular and rvc.any():
+        rv_myo = rv_free & largest_component(myo | rv_free)
+        if rv_myo.sum() < 50:
+            rv_myo = None
+            warnings.append("RV free wall is not attached to the LV wall: simulating the LV only.")
 
     gl = finalize_geometry_layer(
-        grid, myo, lvc, rvc, base_struct, rv_free, np.zeros_like(S), source="skin_assumed",
+        grid, myo, lvc, rvc, base_struct, rv_free if rv_myo is None else rv_free & ~rv_myo, np.zeros_like(S),
+        rv_myo=rv_myo, source="skin_assumed",
         cav_method="assumed", myo_surface=None, myo_part=None, myo_score=0.3,
         named_base={"MitralAnnulus": base_struct}, wall_thickness_mm=prm.lv_wall_mm, warnings=warnings)
     gl.metrics.update({"heart_length_mm": float(L), "av_plane_fraction": float(f_av),
@@ -178,7 +187,7 @@ def build_skin_geometry_layer(skin: SurfaceMesh, up_axis: str = "Z", params: Ski
 
 def label_skin_faces(skin: SurfaceMesh, gl) -> np.ndarray:
     """Which part of the derived anatomy lies under each face of the user's skin."""
-    from .geometry_layer import V_LVC, V_MYO, V_OTHER, V_RVC
+    from .geometry_layer import V_LVC, V_MYO, V_OTHER, V_RV_MYO, V_RVC
 
     g, vc = gl.grid, gl.voxel_class
     c, n = skin.face_centers(), skin.face_normals()
@@ -189,7 +198,7 @@ def label_skin_faces(skin: SurfaceMesh, gl) -> np.ndarray:
             cls = g.sample(vc, c + sgn * dist * g.spacing * n, fill=V_OUT)
             hit = ~found & (cls != V_OUT)
             out[hit & ((cls == V_MYO) | (cls == V_LVC))] = SKIN_LV_EPI
-            out[hit & ((cls == V_RVC) | (cls == V_OTHER))] = SKIN_RV_FREE
+            out[hit & np.isin(cls, (V_RVC, V_OTHER, V_RV_MYO))] = SKIN_RV_FREE
             out[hit & (cls == V_BASE_STRUCT)] = SKIN_BASE
             found |= hit
     return out
